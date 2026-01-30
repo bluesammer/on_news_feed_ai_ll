@@ -16,11 +16,21 @@
 # In[2]:
 
 
-# combined_news_only_enriched.py
+# main.py
 # News feed only, with OpenAI enrichment + keyword scoring rules.
 # First run posts everything (store empty). Cron runs post only new items.
 # Writes combined_feed.json
 # Optional POST to FEED_POST_URL
+#
+# Log upgrades:
+# - Prints counts per source (Newsroom MOH/MLTC, each RSS feed)
+# - Prints combined totals
+# - Runs OpenAI enrichment in buckets (default 50) with clear progress logs
+# - Prints where combined_feed.json is written in Railway
+#
+# Note on "save file onto Lovable":
+# Lovable reads from your feed endpoint. This script saves combined_feed.json on Railway disk
+# and posts new items to FEED_POST_URL. That POST is what makes it show up in Lovable.
 
 import os
 import sys
@@ -28,14 +38,13 @@ import json
 import re
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Set, Optional
+from typing import Dict, List, Any, Set, Optional, Tuple
 from email.utils import parsedate_to_datetime
 
 import requests
 import feedparser
 from requests.adapters import HTTPAdapter, Retry
 
-# OpenAI
 from openai import OpenAI
 
 # ============================================================
@@ -50,10 +59,7 @@ FEED_URLS = [
     "https://news.ontario.ca/mltc/en",
 ]
 
-PATH_TO_ACRONYM = {
-    "moh": "MOH",
-    "mltc": "MLTC",
-}
+PATH_TO_ACRONYM = {"moh": "MOH", "mltc": "MLTC"}
 
 REGISTRY_FEEDS = [
     {
@@ -69,21 +75,9 @@ REGISTRY_FEEDS = [
 ]
 
 EXTRA_RSS_FEEDS = [
-    {
-        "name": "Born Ontario News",
-        "type": "Born Ontario",
-        "url": "https://www.bornontario.ca/news/rss/",
-    },
-    {
-        "name": "IPC PHIPA Decisions",
-        "type": "PHIPA Decisions",
-        "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do",
-    },
-    {
-        "name": "Ontario Health News (FetchRSS)",
-        "type": "Ontario Health News",
-        "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss",
-    },
+    {"name": "Born Ontario News", "type": "Born Ontario", "url": "https://www.bornontario.ca/news/rss/"},
+    {"name": "IPC PHIPA Decisions", "type": "PHIPA Decisions", "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do"},
+    {"name": "Ontario Health News (FetchRSS)", "type": "Ontario Health News", "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss"},
 ]
 
 OUT_JSON = "combined_feed.json"
@@ -95,20 +89,16 @@ FEED_POST_URL = os.getenv(
 
 RAILWAY_API_KEY = os.getenv("RAILWAY_API_KEY", "").strip()
 
-# Local default: skip POST
 POST_ENABLED = os.getenv("POST_ENABLED", "0").strip() == "1"
-
-# Log payload preview and skip POST
 DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
 
-# Skip RSS items without a published date
 SKIP_RSS_IF_NO_PUBLISHED = True
 
-# Reset local store file before run
 RESET_STORE = os.getenv("RESET_STORE", "0").strip() == "1"
-
-# Re-enrich every stored item (not only new)
 REENRICH_ALL = os.getenv("REENRICH_ALL", "0").strip() == "1"
+
+# Enrich bucket size (50 default)
+ENRICH_BATCH_SIZE = int(os.getenv("ENRICH_BATCH_SIZE", "50").strip() or "50")
 
 # ============================================================
 # ENRICHMENT CONFIG
@@ -118,7 +108,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ENRICH_ENABLED = os.getenv("ENRICH_ENABLED", "1").strip() == "1"
 ENRICH_MODEL = os.getenv("ENRICH_MODEL", "gpt-4o-mini").strip()
 
-# Keyword rules file
 SCORE_RULES_PATH = os.getenv("SCORE_RULES_PATH", "scoring_rules.json").strip()
 APPLY_SCORE_RULES = os.getenv("APPLY_SCORE_RULES", "1").strip() == "1"
 
@@ -166,6 +155,7 @@ DOMAIN_SIGNALS = [
     "IPC",
 ]
 
+# Simple fallback mapping. AI can also infer cities from text.
 PLACE_MAP = {
     "lambeth": "London",
     "etobicoke": "Toronto",
@@ -189,6 +179,14 @@ ENRICH_SYSTEM = (
     "Avoid topic 'Other'. Use only allowed topics.\n"
 )
 
+# ============================================================
+# LOG HELPERS
+# ============================================================
+
+def log(msg: str):
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"[{ts}] {msg}")
+
 def utc_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -198,6 +196,10 @@ def clamp_0_100(x: int) -> int:
     if x > 100:
         return 100
     return x
+
+# ============================================================
+# SCORE RULES
+# ============================================================
 
 def load_score_rules() -> Dict[str, Any]:
     if os.path.isfile(SCORE_RULES_PATH) is False:
@@ -247,120 +249,14 @@ def normalize_places(text: str) -> List[str]:
             cities.append(city)
     return cities[:8]
 
+# ============================================================
+# OPENAI CLIENT
+# ============================================================
+
 _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    title = str(row.get("title") or "").strip()
-    excerpt = str(row.get("excerpt") or "").strip()
-    source = str(row.get("ministry_name") or row.get("source") or "").strip()
-    url = str(row.get("url") or "").strip()
-
-    blob = f"{title}\n\n{excerpt}\n\nSource: {source}\nURL: {url}"
-
-    money_backup = extract_money_values(blob)
-    cities_backup = normalize_places(blob)
-
-    row["ai_model"] = ENRICH_MODEL
-    row["ai_enriched_at"] = utc_iso_z()
-
-    if ENRICH_ENABLED is False or _openai_client is None:
-        row["ai_summary_1s"] = title[:220]
-        row["ai_why_lifelabs_cares"] = ""
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
-        row["ai_score_reason"] = "Enrichment disabled"
-        row["ai_topics"] = []
-        row["ai_dollar_values"] = money_backup
-        row["ai_city_labels"] = cities_backup
-        row["ai_signals_found"] = []
-        row["ai_entities"] = []
-        return row
-
-    payload = {
-        "allowed_topics": TOPICS,
-        "domain_signals": DOMAIN_SIGNALS,
-        "place_map": [{"raw": "Lambeth", "city": "London"}, {"raw": "Etobicoke", "city": "Toronto"}],
-        "output_schema": {
-            "ai_summary_1s": "string, 1 sentence",
-            "ai_why_lifelabs_cares": "string, 1 sentence, business impact",
-            "ai_score_0_100": "int 0-100",
-            "ai_score_reason": "string, short",
-            "ai_topics": "array 1-3 from allowed_topics",
-            "ai_dollar_values": "array of strings",
-            "ai_city_labels": "array of Ontario city labels",
-            "ai_signals_found": "array of strings from domain_signals",
-            "ai_entities": "array of strings",
-        },
-        "item": {
-            "title": title,
-            "excerpt": excerpt,
-            "source": source,
-            "url": url,
-        },
-    }
-
-    try:
-        resp = _openai_client.chat.completions.create(
-            model=ENRICH_MODEL,
-            messages=[
-                {"role": "system", "content": ENRICH_SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.1,
-        )
-
-        raw = resp.choices[0].message.content or ""
-        data = json.loads(raw)
-
-        row["ai_summary_1s"] = str(data.get("ai_summary_1s") or "").strip()
-        row["ai_why_lifelabs_cares"] = str(data.get("ai_why_lifelabs_cares") or "").strip()
-
-        base_score = int(data.get("ai_score_0_100") or 0)
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, base_score, rules)
-
-        row["ai_score_reason"] = str(data.get("ai_score_reason") or "").strip()
-
-        topics = data.get("ai_topics") or []
-        topics = [t for t in topics if t in TOPICS]
-        row["ai_topics"] = topics[:3]
-
-        dv = data.get("ai_dollar_values") or []
-        merged_dv: List[str] = []
-        for v in dv + money_backup:
-            v2 = str(v).strip()
-            if v2 and v2 not in merged_dv:
-                merged_dv.append(v2)
-        row["ai_dollar_values"] = merged_dv[:10]
-
-        cities = data.get("ai_city_labels") or []
-        merged_cities: List[str] = []
-        for c in cities + cities_backup:
-            c2 = str(c).strip()
-            if c2 and c2 not in merged_cities:
-                merged_cities.append(c2)
-        row["ai_city_labels"] = merged_cities[:8]
-
-        sigs = data.get("ai_signals_found") or []
-        row["ai_signals_found"] = [str(s).strip() for s in sigs if str(s).strip()][:12]
-
-        ents = data.get("ai_entities") or []
-        row["ai_entities"] = [str(e).strip() for e in ents if str(e).strip()][:12]
-
-    except Exception as e:
-        row["ai_error"] = str(e)
-        row["ai_summary_1s"] = title[:220]
-        row["ai_why_lifelabs_cares"] = ""
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
-        row["ai_score_reason"] = "AI error"
-        row["ai_topics"] = []
-        row["ai_dollar_values"] = money_backup
-        row["ai_city_labels"] = cities_backup
-        row["ai_signals_found"] = []
-        row["ai_entities"] = []
-
-    return row
-
 # ============================================================
-# HELPERS
+# HTML STRIP
 # ============================================================
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -382,6 +278,10 @@ def make_excerpt(item: Dict[str, Any], max_len: int = 420) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 1].rstrip() + "…"
+
+# ============================================================
+# FEED NORMALIZATION
+# ============================================================
 
 def parse_ministry_from_url(url: str) -> str:
     for p in url.split("/"):
@@ -470,8 +370,12 @@ def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
 
     return {"iso": "", "display": ""}
 
-def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
+def parse_rss_feed(feed_cfg: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Returns: (rows, total_entries_seen, rows_emitted)
+    """
     feed = feedparser.parse(feed_cfg["url"])
+    total_entries = len(getattr(feed, "entries", []) or [])
     rows: List[Dict[str, Any]] = []
     collected_at = datetime.now(timezone.utc).isoformat()
 
@@ -502,7 +406,143 @@ def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             "source": feed_cfg.get("source", "rss"),
         })
 
-    return rows
+    return rows, total_entries, len(rows)
+
+# ============================================================
+# ENRICHMENT
+# ============================================================
+
+def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
+    title = str(row.get("title") or "").strip()
+    excerpt = str(row.get("excerpt") or "").strip()
+    source = str(row.get("ministry_name") or row.get("source") or "").strip()
+    url = str(row.get("url") or "").strip()
+
+    blob = f"{title}\n\n{excerpt}\n\nSource: {source}\nURL: {url}"
+
+    money_backup = extract_money_values(blob)
+    cities_backup = normalize_places(blob)
+
+    row["ai_model"] = ENRICH_MODEL
+    row["ai_enriched_at"] = utc_iso_z()
+
+    if ENRICH_ENABLED is False or _openai_client is None:
+        row["ai_summary_1s"] = title[:220]
+        row["ai_why_lifelabs_cares"] = ""
+        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
+        row["ai_score_reason"] = "Enrichment disabled"
+        row["ai_topics"] = []
+        row["ai_dollar_values"] = money_backup
+        row["ai_city_labels"] = cities_backup
+        row["ai_signals_found"] = []
+        row["ai_entities"] = []
+        return row
+
+    payload = {
+        "allowed_topics": TOPICS,
+        "domain_signals": DOMAIN_SIGNALS,
+        "place_map": [{"raw": "Lambeth", "city": "London"}, {"raw": "Etobicoke", "city": "Toronto"}],
+        "output_schema": {
+            "ai_summary_1s": "string, 1 sentence",
+            "ai_why_lifelabs_cares": "string, 1 sentence, business impact",
+            "ai_score_0_100": "int 0-100",
+            "ai_score_reason": "string, short",
+            "ai_topics": "array 1-3 from allowed_topics",
+            "ai_dollar_values": "array of strings",
+            "ai_city_labels": "array of Ontario city labels",
+            "ai_signals_found": "array of strings from domain_signals",
+            "ai_entities": "array of strings",
+        },
+        "item": {"title": title, "excerpt": excerpt, "source": source, "url": url},
+    }
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=ENRICH_MODEL,
+            messages=[
+                {"role": "system", "content": ENRICH_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+        )
+
+        raw = resp.choices[0].message.content or ""
+        data = json.loads(raw)
+
+        row["ai_summary_1s"] = str(data.get("ai_summary_1s") or "").strip()
+        row["ai_why_lifelabs_cares"] = str(data.get("ai_why_lifelabs_cares") or "").strip()
+
+        base_score = int(data.get("ai_score_0_100") or 0)
+        row["ai_score_0_100"] = apply_keyword_score_rules(blob, base_score, rules)
+
+        row["ai_score_reason"] = str(data.get("ai_score_reason") or "").strip()
+
+        topics = data.get("ai_topics") or []
+        topics = [t for t in topics if t in TOPICS]
+        row["ai_topics"] = topics[:3]
+
+        dv = data.get("ai_dollar_values") or []
+        merged_dv: List[str] = []
+        for v in dv + money_backup:
+            v2 = str(v).strip()
+            if v2 and v2 not in merged_dv:
+                merged_dv.append(v2)
+        row["ai_dollar_values"] = merged_dv[:10]
+
+        cities = data.get("ai_city_labels") or []
+        merged_cities: List[str] = []
+        for c in cities + cities_backup:
+            c2 = str(c).strip()
+            if c2 and c2 not in merged_cities:
+                merged_cities.append(c2)
+        row["ai_city_labels"] = merged_cities[:8]
+
+        sigs = data.get("ai_signals_found") or []
+        row["ai_signals_found"] = [str(s).strip() for s in sigs if str(s).strip()][:12]
+
+        ents = data.get("ai_entities") or []
+        row["ai_entities"] = [str(e).strip() for e in ents if str(e).strip()][:12]
+
+    except Exception as e:
+        row["ai_error"] = str(e)
+        row["ai_summary_1s"] = title[:220]
+        row["ai_why_lifelabs_cares"] = ""
+        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
+        row["ai_score_reason"] = "AI error"
+        row["ai_topics"] = []
+        row["ai_dollar_values"] = money_backup
+        row["ai_city_labels"] = cities_backup
+        row["ai_signals_found"] = []
+        row["ai_entities"] = []
+
+    return row
+
+def enrich_in_batches(rows: List[Dict[str, Any]], rules: Dict[str, Any], label: str):
+    total = len(rows)
+    if total == 0:
+        return
+
+    log(f"OpenAI enrichment start: {label}. items={total}. batch_size={ENRICH_BATCH_SIZE}. model={ENRICH_MODEL}. enabled={ENRICH_ENABLED}")
+
+    done = 0
+    batch_idx = 0
+    for start in range(0, total, ENRICH_BATCH_SIZE):
+        end = min(start + ENRICH_BATCH_SIZE, total)
+        batch_idx += 1
+        log(f"Enrich batch {batch_idx}. items {start+1}-{end} of {total}")
+
+        for i in range(start, end):
+            rows[i] = enrich_row_with_openai(rows[i], rules)
+            done += 1
+
+            if done % 10 == 0 or done == total:
+                log(f"Enrich progress: {done}/{total}")
+
+    log(f"OpenAI enrichment done: {label}. items={total}")
+
+# ============================================================
+# FEED ITEM FORMAT
+# ============================================================
 
 def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rid = str(row.get("id") or "").strip()
@@ -563,8 +603,13 @@ def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "ai_entities": row.get("ai_entities"),
             "ai_enriched_at": row.get("ai_enriched_at"),
             "ai_model": row.get("ai_model"),
+            "ai_error": row.get("ai_error"),
         },
     }
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
 def build_session() -> requests.Session:
     s = requests.Session()
@@ -585,37 +630,36 @@ def build_session() -> requests.Session:
 session = build_session()
 
 def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
-    r = session.get(
-        API_URL,
-        params={"language": LANG, "limit": limit, "sort": "desc"},
-        timeout=30,
-    )
+    r = session.get(API_URL, params={"language": LANG, "limit": limit, "sort": "desc"}, timeout=30)
     r.raise_for_status()
     data = r.json().get("data", [])
     return [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
 
 def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Response]:
     if not items:
+        log("POST: no items. skip")
         return None
 
     if DRY_RUN or (POST_ENABLED is False):
-        print("POST skipped.")
-        print("FEED_POST_URL:", FEED_POST_URL)
-        print("Items:", len(items))
-        print("Payload preview:", json.dumps({"items": items}, ensure_ascii=False)[:900])
+        log("POST skipped (DRY_RUN or POST_ENABLED=0)")
+        log(f"FEED_POST_URL: {FEED_POST_URL}")
+        log(f"Items: {len(items)}")
+        log("Payload preview: " + json.dumps({"items": items[:3]}, ensure_ascii=False)[:900])
         return None
 
     if RAILWAY_API_KEY == "":
-        print("RAILWAY_API_KEY absent. POST skipped.")
+        log("RAILWAY_API_KEY absent. POST skipped.")
         return None
 
     headers = {"x-api-key": RAILWAY_API_KEY, "Content-Type": "application/json"}
     payload = {"items": items}
 
+    log(f"POST start. url={FEED_POST_URL}. items={len(items)}")
     r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=30)
-    print("Feed POST status:", r.status_code)
-    print("Feed POST body preview:", (r.text or "")[:900])
+    log(f"Feed POST status: {r.status_code}")
+    log("Feed POST body preview: " + (r.text or "")[:900])
     r.raise_for_status()
+    log("POST done")
     return r
 
 # ============================================================
@@ -623,21 +667,33 @@ def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Resp
 # ============================================================
 
 def main():
+    log("RUN START")
+    log(f"ENV POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} ENRICH_ENABLED={int(ENRICH_ENABLED)} RESET_STORE={int(RESET_STORE)} REENRICH_ALL={int(REENRICH_ALL)}")
+    log(f"ENV ENRICH_MODEL={ENRICH_MODEL} ENRICH_BATCH_SIZE={ENRICH_BATCH_SIZE}")
+    log(f"OUT_JSON will write to: {os.path.abspath(OUT_JSON)}")
+    log("Lovable gets data from your feed endpoint. This script posts items to FEED_POST_URL.")
+
     if RESET_STORE and os.path.exists(OUT_JSON):
         os.remove(OUT_JSON)
+        log("RESET_STORE=1 removed combined_feed.json")
 
     rules = load_score_rules()
+    log(f"Loaded scoring rules. boosts={len(rules.get('boosts', []))} penalties={len(rules.get('penalties', []))} file={SCORE_RULES_PATH}")
 
     store = load_existing()
     existing_items = store.get("items", [])
     seen: Set[str] = {str(x.get("id")) for x in existing_items if x.get("id")}
+    log(f"Store loaded. existing_items={len(existing_items)} seen_ids={len(seen)}")
 
     new_rows: List[Dict[str, Any]] = []
 
     # A1) Ontario Newsroom API
+    log("Fetch Ontario Newsroom API start")
     acronyms = [parse_ministry_from_url(u) for u in FEED_URLS]
     for acr in acronyms:
         items = fetch_releases_for_ministry(acr)
+        added = 0
+        log(f"Newsroom {acr} fetched {len(items)} items")
         for it in items:
             row = to_row(it)
             if not row.get("id"):
@@ -647,13 +703,19 @@ def main():
                 continue
             seen.add(rid)
             new_rows.append(row)
+            added += 1
+        log(f"Newsroom {acr} added {added} new items")
+    log("Fetch Ontario Newsroom API done")
 
     # A2) Regulatory Registry RSS
+    log("Fetch Regulatory Registry RSS start")
     for cfg in REGISTRY_FEEDS:
         cfg2 = dict(cfg)
         cfg2["acronym"] = "REG"
         cfg2["source"] = "regulatory_registry_rss"
-        rss_items = parse_rss_feed(cfg2)
+        rss_items, total_entries, emitted = parse_rss_feed(cfg2)
+        added = 0
+        log(f"RSS {cfg2['name']} total_entries={total_entries} emitted={emitted}")
         for row in rss_items:
             rid = str(row.get("id") or "")
             if rid == "":
@@ -662,13 +724,19 @@ def main():
                 continue
             seen.add(rid)
             new_rows.append(row)
+            added += 1
+        log(f"RSS {cfg2['name']} added {added} new items")
+    log("Fetch Regulatory Registry RSS done")
 
     # A3) Extra RSS feeds
+    log("Fetch Extra RSS start")
     for cfg in EXTRA_RSS_FEEDS:
         cfg2 = dict(cfg)
         cfg2["acronym"] = "RSS"
         cfg2["source"] = "extra_rss"
-        rss_items = parse_rss_feed(cfg2)
+        rss_items, total_entries, emitted = parse_rss_feed(cfg2)
+        added = 0
+        log(f"RSS {cfg2['name']} total_entries={total_entries} emitted={emitted}")
         for row in rss_items:
             rid = str(row.get("id") or "")
             if rid == "":
@@ -677,15 +745,18 @@ def main():
                 continue
             seen.add(rid)
             new_rows.append(row)
+            added += 1
+        log(f"RSS {cfg2['name']} added {added} new items")
+    log("Fetch Extra RSS done")
 
-    # Enrich only new rows (default)
-    for i in range(len(new_rows)):
-        new_rows[i] = enrich_row_with_openai(new_rows[i], rules)
+    log(f"COMBINE done. new_rows={len(new_rows)} existing_items={len(existing_items)} total_after_store={(len(existing_items) + len(new_rows))}")
 
-    # Optional re-enrich all stored items
+    # Enrich only new rows (default) in visible buckets
+    enrich_in_batches(new_rows, rules, label="new_rows")
+
+    # Optional re-enrich all stored items (also in buckets)
     if REENRICH_ALL and existing_items:
-        for i in range(len(existing_items)):
-            existing_items[i] = enrich_row_with_openai(existing_items[i], rules)
+        enrich_in_batches(existing_items, rules, label="existing_items (REENRICH_ALL)")
 
     # Store
     if new_rows:
@@ -707,21 +778,24 @@ def main():
             ensure_ascii=False,
         )
 
+    log("STORE write done")
+    log(f"combined_feed.json path: {os.path.abspath(OUT_JSON)}")
+    log(f"combined_feed.json exists: {os.path.exists(OUT_JSON)}")
+    if os.path.exists(OUT_JSON):
+        log(f"combined_feed.json size_bytes: {os.path.getsize(OUT_JSON)}")
+
     # POST only new items
     feed_items_raw = [row_to_feed_item(r) for r in new_rows]
     feed_items = [x for x in feed_items_raw if x is not None]
 
-    print("---- FEED ----")
-    print("New rows:", len(new_rows))
-    print("New feed items:", len(feed_items))
-    print("Output file path:", os.path.abspath(OUT_JSON))
-    print("File exists:", os.path.exists(OUT_JSON))
-    if os.path.exists(OUT_JSON):
-        print("File size (bytes):", os.path.getsize(OUT_JSON))
+    log("FEED build done")
+    log(f"New feed items prepared: {len(feed_items)}")
+    if feed_items:
+        log("Feed item sample: " + json.dumps(feed_items[0], ensure_ascii=False)[:900])
 
     post_to_feed_function(feed_items)
 
-    print("---- DONE ----")
+    log("RUN DONE")
     sys.stdout.flush()
 
 if __name__ == "__main__":
