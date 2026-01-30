@@ -1,0 +1,80 @@
+C:\Users\Blues\1 lifelabs news ontario feed better now
+
+
+"C:\Users\Blues\1 lifelabs news ontario feed better now\OH_feed_ingest_step1_V7.ipynb"
+
+
+What this script does.
+
+Pulls Ontario health news from official sources only.
+
+Sources include Ministry of Health, Ministry of Long Term Care, Regulatory Registry, and related RSS feeds.
+
+Runs a full backfill on first run.
+
+On later cron runs, only processes new items never seen before.
+
+What happens for each new item.
+
+Extracts title, date, ministry, excerpt, and link.
+
+Sends the item to the ChatGPT API.
+
+Generates a clean one sentence summary focused on lab and health system impact.
+
+Explains why the update matters for LifeLabs style decision making.
+
+Extracts dollar amounts if funding or billing is mentioned.
+
+Converts counties or regions into clear Ontario city names.
+
+Assigns an importance score from 0 to 100.
+
+Tags the item into fixed health policy topics.
+
+Scoring logic.
+
+Base score comes from the AI.
+
+Optional keyword rules adjust the score up or down.
+
+Rules live in scoring_rules.json so you edit them without touching code.
+
+Output.
+
+Writes all items, raw plus enriched, into combined_feed.json.
+
+Pushes only new enriched items into the RSS feed endpoint.
+
+Never reposts the same item twice.
+
+Operational behavior.
+
+Safe to run on a cron schedule.
+
+First run fills history.
+
+Future runs append only new news.
+
+No Google Sheets, no URL monitoring, no Discord, no email.
+
+Why this design.
+
+Keeps AI logic centralized in Python.
+
+Keeps the feed clean and decision focused.
+
+Makes scoring and tuning fast to change.
+
+Avoids duplicate posts and wasted API calls.
+
+
+
+Jan 30. i removed the other part with the url scanning. 
+
+
+aremove his part
+
+/1%20lifelabs+cron_url_scanner/URL_scan_V1.ipynb
+
+into 1

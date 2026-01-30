@@ -1,0 +1,20 @@
+{
+  "boosts": [
+    { "kw": "O. Reg. 552", "pts": 20 },
+    { "kw": "Regulation 552", "pts": 20 },
+    { "kw": "LSCCLA", "pts": 25 },
+    { "kw": "laboratory", "pts": 10 },
+    { "kw": "community lab", "pts": 15 },
+    { "kw": "fee schedule", "pts": 20 },
+    { "kw": "OHIP", "pts": 15 },
+    { "kw": "point of care", "pts": 15 },
+    { "kw": "scope of practice", "pts": 15 },
+    { "kw": "RHPA", "pts": 15 },
+    { "kw": "consultation", "pts": 10 }
+  ],
+  "penalties": [
+    { "kw": "parking", "pts": -25 },
+    { "kw": "sports", "pts": -30 },
+    { "kw": "weather", "pts": -30 }
+  ]
+}
