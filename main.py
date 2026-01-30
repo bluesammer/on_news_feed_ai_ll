@@ -17,10 +17,8 @@
 
 
 # main.py
-# Ontario health news feed with OpenAI enrichment + keyword scoring rules.
-# Saves combined_feed.json locally (Railway ephemeral).
-# Posts enriched items to FEED_POST_URL in batches.
-# Resume-safe: writes store after every batch.
+# News feed + OpenAI enrichment + keyword scoring rules
+# Stores combined_feed_ai.json in Supabase Storage so cron runs resume correctly
 
 import os
 import sys
@@ -37,22 +35,9 @@ from requests.adapters import HTTPAdapter, Retry
 
 from openai import OpenAI
 
-# ----------------------------
-# LOGGING
-# ----------------------------
-
-def log(msg: str) -> None:
-    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    print(f"[{ts}] {msg}", flush=True)
-
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
-# ----------------------------
+# ============================================================
 # CONFIG
-# ----------------------------
+# ============================================================
 
 API_URL = "https://api.news.ontario.ca/api/v1/releases"
 LANG = "en"
@@ -62,7 +47,10 @@ FEED_URLS = [
     "https://news.ontario.ca/mltc/en",
 ]
 
-PATH_TO_ACRONYM = {"moh": "MOH", "mltc": "MLTC"}
+PATH_TO_ACRONYM = {
+    "moh": "MOH",
+    "mltc": "MLTC",
+}
 
 REGISTRY_FEEDS = [
     {
@@ -78,12 +66,24 @@ REGISTRY_FEEDS = [
 ]
 
 EXTRA_RSS_FEEDS = [
-    {"name": "Born Ontario News", "type": "Born Ontario", "url": "https://www.bornontario.ca/news/rss/"},
-    {"name": "IPC PHIPA Decisions", "type": "PHIPA Decisions", "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do"},
-    {"name": "Ontario Health News (FetchRSS)", "type": "Ontario Health News", "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss"},
+    {
+        "name": "Born Ontario News",
+        "type": "Born Ontario",
+        "url": "https://www.bornontario.ca/news/rss/",
+    },
+    {
+        "name": "IPC PHIPA Decisions",
+        "type": "PHIPA Decisions",
+        "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do",
+    },
+    {
+        "name": "Ontario Health News (FetchRSS)",
+        "type": "Ontario Health News",
+        "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss",
+    },
 ]
 
-OUT_JSON = os.getenv("OUT_JSON", "combined_feed.json").strip()
+OUT_JSON_LOCAL = "combined_feed_ai.json"
 
 FEED_POST_URL = os.getenv(
     "FEED_POST_URL",
@@ -102,9 +102,20 @@ REENRICH_ALL = os.getenv("REENRICH_ALL", "0").strip() == "1"
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50").strip())
 
-# ----------------------------
-# ENRICHMENT
-# ----------------------------
+# ============================================================
+# SUPABASE STORAGE STORE
+# ============================================================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "").strip()
+SUPABASE_OBJECT_PATH = os.getenv("SUPABASE_OBJECT_PATH", "feeds/combined_feed_ai.json").strip()
+
+STORE_REMOTE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET and SUPABASE_OBJECT_PATH)
+
+# ============================================================
+# ENRICHMENT CONFIG
+# ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ENRICH_ENABLED = os.getenv("ENRICH_ENABLED", "1").strip() == "1"
@@ -180,6 +191,11 @@ ENRICH_SYSTEM = (
     "Avoid topic 'Other'. Use only allowed topics.\n"
 )
 
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    print(f"[{ts}] {msg}")
+    sys.stdout.flush()
+
 def utc_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -189,6 +205,85 @@ def clamp_0_100(x: int) -> int:
     if x > 100:
         return 100
     return x
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "PUT"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+session = build_session()
+
+# ============================================================
+# SUPABASE STORAGE HELPERS
+# ============================================================
+
+def supabase_object_url() -> str:
+    # Authenticated Storage endpoint
+    return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{SUPABASE_OBJECT_PATH}"
+
+def supabase_headers_json() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": "application/json",
+        "x-upsert": "true",
+    }
+
+def load_store_remote() -> Dict[str, Any]:
+    if STORE_REMOTE_ENABLED is False:
+        return {"items": []}
+
+    url = supabase_object_url()
+    h = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+    try:
+        r = session.get(url, headers=h, timeout=30)
+        if r.status_code == 404:
+            log("Remote store missing. Starting fresh.")
+            return {"items": []}
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) is False:
+            return {"items": []}
+        data.setdefault("items", [])
+        return data
+    except Exception as e:
+        log(f"Remote store load error: {e}. Starting fresh.")
+        return {"items": []}
+
+def save_store_remote(store: Dict[str, Any]) -> None:
+    if STORE_REMOTE_ENABLED is False:
+        return
+
+    url = supabase_object_url()
+    h = supabase_headers_json()
+    payload = json.dumps(store, ensure_ascii=False).encode("utf-8")
+
+    r = session.put(url, headers=h, data=payload, timeout=30)
+    r.raise_for_status()
+
+def save_store_local(store: Dict[str, Any]) -> str:
+    with open(OUT_JSON_LOCAL, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+    return os.path.abspath(OUT_JSON_LOCAL)
+
+# ============================================================
+# SCORING RULES
+# ============================================================
 
 def load_score_rules() -> Dict[str, Any]:
     if os.path.isfile(SCORE_RULES_PATH) is False:
@@ -238,6 +333,10 @@ def normalize_places(text: str) -> List[str]:
             cities.append(city)
     return cities[:8]
 
+# ============================================================
+# ENRICHMENT
+# ============================================================
+
 _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
@@ -269,7 +368,6 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
     payload = {
         "allowed_topics": TOPICS,
         "domain_signals": DOMAIN_SIGNALS,
-        "place_map": [{"raw": "Lambeth", "city": "London"}, {"raw": "Etobicoke", "city": "Toronto"}],
         "output_schema": {
             "ai_summary_1s": "string, 1 sentence",
             "ai_why_lifelabs_cares": "string, 1 sentence, business impact",
@@ -281,7 +379,12 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
             "ai_signals_found": "array of strings from domain_signals",
             "ai_entities": "array of strings",
         },
-        "item": {"title": title, "excerpt": excerpt, "source": source, "url": url},
+        "item": {
+            "title": title,
+            "excerpt": excerpt,
+            "source": source,
+            "url": url,
+        },
     }
 
     try:
@@ -302,6 +405,7 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
 
         base_score = int(data.get("ai_score_0_100") or 0)
         row["ai_score_0_100"] = apply_keyword_score_rules(blob, base_score, rules)
+
         row["ai_score_reason"] = str(data.get("ai_score_reason") or "").strip()
 
         topics = data.get("ai_topics") or []
@@ -344,9 +448,9 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
 
     return row
 
-# ----------------------------
+# ============================================================
 # FETCH + PARSE
-# ----------------------------
+# ============================================================
 
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -395,25 +499,6 @@ def to_row(item: Dict[str, Any]) -> Dict[str, Any]:
         "source": "ontario_newsroom_api",
     }
 
-def load_existing() -> Dict[str, Any]:
-    if not os.path.exists(OUT_JSON):
-        return {"items": []}
-    with open(OUT_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_store(existing_items: List[Dict[str, Any]]) -> None:
-    payload = {
-        "source_urls": FEED_URLS,
-        "registry_feeds": [x["url"] for x in REGISTRY_FEEDS],
-        "extra_rss_feeds": [x["url"] for x in EXTRA_RSS_FEEDS],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(existing_items),
-        "items": existing_items,
-    }
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    log(f"Saved store file: {os.path.abspath(OUT_JSON)} items={len(existing_items)}")
-
 def rss_id(entry: Dict[str, Any]) -> str:
     base = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title", "")
     return hashlib.sha256(str(base).encode("utf-8")).hexdigest()
@@ -446,6 +531,7 @@ def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
     if getattr(e, "published_parsed", None):
         dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
         return {"iso": _iso_z_from_dt(dt), "display": e.get("published", "") or ""}
+
     if getattr(e, "updated_parsed", None):
         dt = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
         return {"iso": _iso_z_from_dt(dt), "display": e.get("updated", "") or ""}
@@ -466,7 +552,7 @@ def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
 def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
     log(f"RSS fetch start: {feed_cfg['name']} url={feed_cfg['url']}")
     feed = feedparser.parse(feed_cfg["url"])
-    entries = getattr(feed, "entries", []) or []
+    entries = getattr(feed, "entries", [])
     log(f"RSS fetched: {feed_cfg['name']} entries={len(entries)}")
 
     rows: List[Dict[str, Any]] = []
@@ -502,6 +588,19 @@ def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
     log(f"RSS parsed: {feed_cfg['name']} usable_rows={len(rows)}")
     return rows
 
+def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
+    log(f"API fetch start: Ontario Newsroom acronym={acronym} limit={limit}")
+    r = session.get(API_URL, params={"language": LANG, "limit": limit, "sort": "desc"}, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    filtered = [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
+    log(f"API fetched: acronym={acronym} total={len(data)} filtered={len(filtered)}")
+    return filtered
+
+# ============================================================
+# FEED POST
+# ============================================================
+
 def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rid = str(row.get("id") or "").strip()
     title = str(row.get("title") or "").strip()
@@ -510,6 +609,7 @@ def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     published = str(row.get("date") or "").strip()
     collected = str(row.get("collected_at") or "").strip()
+
     if not published:
         return None
 
@@ -563,72 +663,54 @@ def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         },
     }
 
-def build_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-session = build_session()
-
-def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
-    log(f"API fetch start: Ontario Newsroom acronym={acronym} limit={limit}")
-    r = session.get(API_URL, params={"language": LANG, "limit": limit, "sort": "desc"}, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    filtered = [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
-    log(f"API fetched: acronym={acronym} total={len(data)} filtered={len(filtered)}")
-    return filtered
-
-def post_to_feed_function(items: List[Dict[str, Any]]) -> None:
+def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Response]:
     if not items:
-        log("POST: no items")
-        return
+        return None
 
     if DRY_RUN or (POST_ENABLED is False):
         log(f"POST skipped. POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} items={len(items)}")
-        log("POST preview: " + json.dumps({"items": items[:2]}, ensure_ascii=False)[:700])
-        return
+        log("POST preview: " + json.dumps({"items": items}, ensure_ascii=False)[:900])
+        return None
 
     if RAILWAY_API_KEY == "":
-        log("POST skipped. RAILWAY_API_KEY missing.")
-        return
+        log("RAILWAY_API_KEY absent. POST skipped.")
+        return None
 
     headers = {"x-api-key": RAILWAY_API_KEY, "Content-Type": "application/json"}
     payload = {"items": items}
 
-    log(f"POST start: url={FEED_POST_URL} items={len(items)}")
-    r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=45)
-    log(f"POST done: status={r.status_code} body_preview={(r.text or '')[:300]}")
+    r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=30)
+    log(f"Feed POST status: {r.status_code}")
+    log("Feed POST body preview: " + (r.text or "")[:900])
     r.raise_for_status()
+    return r
 
-# ----------------------------
+# ============================================================
 # MAIN
-# ----------------------------
+# ============================================================
 
 def main() -> None:
     log("Job start")
     log(f"Config: POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} ENRICH_ENABLED={int(ENRICH_ENABLED)} BATCH_SIZE={BATCH_SIZE}")
-    log(f"Output: {os.path.abspath(OUT_JSON)}")
+    log(f"Local output: {os.path.abspath(OUT_JSON_LOCAL)}")
+    log(f"Remote store: enabled={int(STORE_REMOTE_ENABLED)} bucket={SUPABASE_BUCKET} path={SUPABASE_OBJECT_PATH}")
 
-    if RESET_STORE and os.path.exists(OUT_JSON):
-        os.remove(OUT_JSON)
-        log("Store reset: removed existing combined_feed.json")
+    if RESET_STORE:
+        log("RESET_STORE=1")
+        if STORE_REMOTE_ENABLED:
+            # Overwrite with empty store
+            empty = {"items": []}
+            save_store_remote(empty)
+            log("Remote store reset complete.")
+        else:
+            if os.path.exists(OUT_JSON_LOCAL):
+                os.remove(OUT_JSON_LOCAL)
+                log("Local store file removed.")
 
     rules = load_score_rules()
     log(f"Scoring rules loaded: boosts={len(rules.get('boosts', []))} penalties={len(rules.get('penalties', []))}")
 
-    store = load_existing()
+    store = load_store_remote() if STORE_REMOTE_ENABLED else {"items": []}
     existing_items = store.get("items", [])
     seen: Set[str] = {str(x.get("id")) for x in existing_items if x.get("id")}
     log(f"Store loaded: existing_items={len(existing_items)} seen_ids={len(seen)}")
@@ -640,16 +722,16 @@ def main() -> None:
     log(f"Sources: Ontario Newsroom API acronyms={acronyms}")
     for acr in acronyms:
         items = fetch_releases_for_ministry(acr)
+        added = 0
         for it in items:
             row = to_row(it)
-            rid = str(row.get("id") or "").strip()
-            if rid == "":
-                continue
-            if rid in seen:
+            rid = str(row.get("id") or "")
+            if rid == "" or rid in seen:
                 continue
             seen.add(rid)
             new_rows.append(row)
-    log(f"Collected from API: new_rows={len(new_rows)}")
+            added += 1
+        log(f"API added: acronym={acr} added={added}")
 
     # A2) Regulatory Registry RSS
     log(f"Sources: Regulatory Registry feeds={len(REGISTRY_FEEDS)}")
@@ -661,9 +743,7 @@ def main() -> None:
         added = 0
         for row in rss_items:
             rid = str(row.get("id") or "")
-            if rid == "":
-                continue
-            if rid in seen:
+            if rid == "" or rid in seen:
                 continue
             seen.add(rid)
             new_rows.append(row)
@@ -680,67 +760,92 @@ def main() -> None:
         added = 0
         for row in rss_items:
             rid = str(row.get("id") or "")
-            if rid == "":
-                continue
-            if rid in seen:
+            if rid == "" or rid in seen:
                 continue
             seen.add(rid)
             new_rows.append(row)
             added += 1
         log(f"Extra feed added: {cfg['name']} added={added}")
 
-    log(f"Total new items to enrich: {len(new_rows)}")
+    total = len(new_rows)
+    log(f"Total new items to enrich: {total}")
 
-    if len(new_rows) == 0:
-        log("No new items. Done.")
+    if total == 0:
+        # Still write store back so timestamps update if needed
+        store_out = {
+            "source_urls": FEED_URLS,
+            "registry_feeds": [x["url"] for x in REGISTRY_FEEDS],
+            "extra_rss_feeds": [x["url"] for x in EXTRA_RSS_FEEDS],
+            "updated_at": utc_iso_z(),
+            "count": len(existing_items),
+            "items": existing_items,
+        }
+        save_store_local(store_out)
+        if STORE_REMOTE_ENABLED:
+            save_store_remote(store_out)
+            log("Remote store saved (no new items).")
+        log("Job done")
         return
 
-    if ENRICH_ENABLED and _openai_client is None:
-        log("OpenAI key missing. Enrichment disabled by key state.")
+    # Enrich in batches and checkpoint to Supabase Storage
+    enriched_all: List[Dict[str, Any]] = []
+    feed_all: List[Dict[str, Any]] = []
 
-    # Enrich in batches and save progress each batch
-    total = len(new_rows)
-    batch_num = 0
-    start_idx = 0
+    batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
-    while start_idx < total:
-        batch_num += 1
-        end_idx = min(start_idx + BATCH_SIZE, total)
-        log(f"Enrich batch start: batch={batch_num} range={start_idx+1}-{end_idx} of {total}")
+    for b in range(batches):
+        start = b * BATCH_SIZE
+        end = min(start + BATCH_SIZE, total)
+        batch_rows = new_rows[start:end]
+        log(f"Enrich batch start: batch={b+1} range={start+1}-{end} of {total}")
 
-        batch = new_rows[start_idx:end_idx]
-        enriched_batch: List[Dict[str, Any]] = []
-        for j, row in enumerate(batch, start=1):
-            enriched = enrich_row_with_openai(row, rules)
-            enriched_batch.append(enriched)
-            if j % 5 == 0 or j == len(batch):
-                log(f"Enrich progress: batch={batch_num} item={j}/{len(batch)}")
+        for i in range(len(batch_rows)):
+            batch_rows[i] = enrich_row_with_openai(batch_rows[i], rules)
+            if (i + 1) % 5 == 0 or (i + 1) == len(batch_rows):
+                log(f"Enrich progress: batch={b+1} item={i+1}/{len(batch_rows)}")
 
-        # store progress
-        existing_items.extend(enriched_batch)
+        # Append enriched
+        enriched_all.extend(batch_rows)
+
+        # Optional re-enrich existing
+        if REENRICH_ALL and existing_items:
+            log(f"REENRICH_ALL=1 start existing_items={len(existing_items)}")
+            for i in range(len(existing_items)):
+                existing_items[i] = enrich_row_with_openai(existing_items[i], rules)
+                if (i + 1) % 25 == 0 or (i + 1) == len(existing_items):
+                    log(f"REENRICH_ALL progress: item={i+1}/{len(existing_items)}")
+
+        # Store update
+        existing_items.extend(batch_rows)
         existing_items.sort(key=lambda x: x.get("date") or "", reverse=True)
-        save_store(existing_items)
 
-        # post progress (Lovable reads from your feed endpoint)
-        feed_items_raw = [row_to_feed_item(r) for r in enriched_batch]
+        store_out = {
+            "source_urls": FEED_URLS,
+            "registry_feeds": [x["url"] for x in REGISTRY_FEEDS],
+            "extra_rss_feeds": [x["url"] for x in EXTRA_RSS_FEEDS],
+            "updated_at": utc_iso_z(),
+            "count": len(existing_items),
+            "items": existing_items,
+        }
+
+        local_path = save_store_local(store_out)
+        log(f"Saved local store file: {local_path} items={len(existing_items)}")
+
+        if STORE_REMOTE_ENABLED:
+            save_store_remote(store_out)
+            log(f"Saved remote store file: bucket={SUPABASE_BUCKET} path={SUPABASE_OBJECT_PATH} items={len(existing_items)}")
+
+        # Post feed for this batch only
+        feed_items_raw = [row_to_feed_item(r) for r in batch_rows]
         feed_items = [x for x in feed_items_raw if x is not None]
-        log(f"Feed batch ready: batch={batch_num} feed_items={len(feed_items)}")
+        feed_all.extend(feed_items)
+
+        log(f"Feed batch ready: batch={b+1} feed_items={len(feed_items)}")
         post_to_feed_function(feed_items)
 
-        log(f"Enrich batch done: batch={batch_num} saved_and_posted={len(enriched_batch)}")
-        start_idx = end_idx
+        log(f"Enrich batch done: batch={b+1} saved_and_posted={len(batch_rows)}")
 
-    # Optional re-enrich all stored items
-    if REENRICH_ALL and existing_items:
-        log(f"REENRICH_ALL start: items={len(existing_items)}")
-        for i in range(len(existing_items)):
-            existing_items[i] = enrich_row_with_openai(existing_items[i], rules)
-            if (i + 1) % BATCH_SIZE == 0:
-                log(f"REENRICH_ALL progress: {i+1}/{len(existing_items)}")
-                save_store(existing_items)
-        save_store(existing_items)
-        log("REENRICH_ALL done")
-
+    log(f"Run summary: new_enriched={len(enriched_all)} posted_items={len(feed_all)} local_store={os.path.abspath(OUT_JSON_LOCAL)}")
     log("Job done")
 
 if __name__ == "__main__":
