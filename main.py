@@ -17,28 +17,17 @@
 
 
 # main.py
-# News feed only, with OpenAI enrichment + keyword scoring rules.
-# First run posts everything (store empty). Cron runs post only new items.
-# Writes combined_feed.json
-# Optional POST to FEED_POST_URL
-#
-# Log upgrades:
-# - Prints counts per source (Newsroom MOH/MLTC, each RSS feed)
-# - Prints combined totals
-# - Runs OpenAI enrichment in buckets (default 50) with clear progress logs
-# - Prints where combined_feed.json is written in Railway
-#
-# Note on "save file onto Lovable":
-# Lovable reads from your feed endpoint. This script saves combined_feed.json on Railway disk
-# and posts new items to FEED_POST_URL. That POST is what makes it show up in Lovable.
+# Ontario health news + RSS + OpenAI enrichment + keyword scoring.
+# Logs show progress in Railway.
 
 import os
 import sys
 import json
 import re
 import hashlib
+import time
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Set, Optional, Tuple
+from typing import Dict, List, Any, Set, Optional
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -88,7 +77,6 @@ FEED_POST_URL = os.getenv(
 ).strip()
 
 RAILWAY_API_KEY = os.getenv("RAILWAY_API_KEY", "").strip()
-
 POST_ENABLED = os.getenv("POST_ENABLED", "0").strip() == "1"
 DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
 
@@ -97,8 +85,9 @@ SKIP_RSS_IF_NO_PUBLISHED = True
 RESET_STORE = os.getenv("RESET_STORE", "0").strip() == "1"
 REENRICH_ALL = os.getenv("REENRICH_ALL", "0").strip() == "1"
 
-# Enrich bucket size (50 default)
+# Batch controls
 ENRICH_BATCH_SIZE = int(os.getenv("ENRICH_BATCH_SIZE", "50").strip() or "50")
+MAX_ENRICH_PER_RUN = int(os.getenv("MAX_ENRICH_PER_RUN", "0").strip() or "0")
 
 # ============================================================
 # ENRICHMENT CONFIG
@@ -155,7 +144,6 @@ DOMAIN_SIGNALS = [
     "IPC",
 ]
 
-# Simple fallback mapping. AI can also infer cities from text.
 PLACE_MAP = {
     "lambeth": "London",
     "etobicoke": "Toronto",
@@ -180,12 +168,25 @@ ENRICH_SYSTEM = (
 )
 
 # ============================================================
-# LOG HELPERS
+# LOGGING
 # ============================================================
 
-def log(msg: str):
+def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] {msg}", flush=True)
+
+# ============================================================
+# SMALL HELPERS
+# ============================================================
+
+TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_html(s: str) -> str:
+    s = s or ""
+    s = s.replace("&mdash;", " - ").replace("&ndash;", " - ").replace("&nbsp;", " ")
+    s = TAG_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def utc_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -197,8 +198,195 @@ def clamp_0_100(x: int) -> int:
         return 100
     return x
 
+def make_excerpt(item: Dict[str, Any], max_len: int = 420) -> str:
+    raw = item.get("content_lead") or item.get("content_subtitle") or ""
+    text = strip_html(raw)
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+def parse_ministry_from_url(url: str) -> str:
+    for p in url.split("/"):
+        key = p.lower()
+        if key in PATH_TO_ACRONYM:
+            return PATH_TO_ACRONYM[key]
+    raise ValueError(f"Unknown ministry in url: {url}")
+
+def build_public_url(item: Dict[str, Any]) -> str:
+    rid = item.get("release_id_translated") or item.get("id")
+    slug = item.get("slug") or ""
+    return f"https://news.ontario.ca/{LANG}/release/{rid}/{slug}"
+
+def to_row(item: Dict[str, Any]) -> Dict[str, Any]:
+    rid = item.get("release_id_translated") or item.get("id")
+    collected_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": rid,
+        "date": item.get("release_date_time") or "",
+        "date_display": item.get("release_date_time_formatted") or "",
+        "collected_at": collected_at,
+        "type": item.get("release_type_name") or item.get("release_type_label") or "",
+        "ministry_acronym": (item.get("ministry_acronym") or "").strip(),
+        "ministry_name": item.get("ministry_name") or "",
+        "title": item.get("clean_title") or item.get("content_title") or "",
+        "excerpt": make_excerpt(item, max_len=420),
+        "url": build_public_url(item),
+        "source": "ontario_newsroom_api",
+    }
+
+def load_existing() -> Dict[str, Any]:
+    if not os.path.exists(OUT_JSON):
+        return {"items": []}
+    with open(OUT_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def rss_id(entry: Dict[str, Any]) -> str:
+    base = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title", "")
+    return hashlib.sha256(str(base).encode("utf-8")).hexdigest()
+
+def _iso_z_from_dt(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+def _try_parse_any_date_string(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    try:
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return _iso_z_from_dt(dt)
+        dt = datetime.fromisoformat(s)
+        return _iso_z_from_dt(dt)
+    except Exception:
+        pass
+    try:
+        dt = parsedate_to_datetime(s)
+        return _iso_z_from_dt(dt)
+    except Exception:
+        return ""
+
+def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
+    if getattr(e, "published_parsed", None):
+        dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+        return {"iso": _iso_z_from_dt(dt), "display": e.get("published", "") or ""}
+    if getattr(e, "updated_parsed", None):
+        dt = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
+        return {"iso": _iso_z_from_dt(dt), "display": e.get("updated", "") or ""}
+    raw = e.get("published") or e.get("updated") or ""
+    parsed = _try_parse_any_date_string(raw)
+    if parsed:
+        return {"iso": parsed, "display": raw}
+    for k in ["dc_date", "dc:date", "date", "pubDate"]:
+        raw2 = e.get(k, "") if isinstance(e, dict) else ""
+        parsed2 = _try_parse_any_date_string(str(raw2))
+        if parsed2:
+            return {"iso": parsed2, "display": str(raw2)}
+    return {"iso": "", "display": ""}
+
+def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
+    t0 = time.perf_counter()
+    feed = feedparser.parse(feed_cfg["url"])
+    rows: List[Dict[str, Any]] = []
+    collected_at = datetime.now(timezone.utc).isoformat()
+
+    total = 0
+    skipped_no_date = 0
+
+    for e in getattr(feed, "entries", []):
+        total += 1
+        rid = rss_id(e)
+        pub = _extract_published_from_entry(e)
+        dt_iso = pub["iso"]
+        dt_display = pub["display"]
+
+        if SKIP_RSS_IF_NO_PUBLISHED and not dt_iso:
+            skipped_no_date += 1
+            continue
+
+        summary = strip_html(e.get("summary", "") or e.get("description", "") or "")
+        if summary and len(summary) > 420:
+            summary = summary[:419].rstrip() + "…"
+
+        rows.append({
+            "id": rid,
+            "date": dt_iso,
+            "date_display": dt_display,
+            "collected_at": collected_at,
+            "type": feed_cfg["type"],
+            "ministry_acronym": feed_cfg.get("acronym", "RSS"),
+            "ministry_name": feed_cfg["name"],
+            "title": strip_html(e.get("title", "")),
+            "excerpt": summary,
+            "url": e.get("link", ""),
+            "source": feed_cfg.get("source", "rss"),
+        })
+
+    dt = time.perf_counter() - t0
+    log(f"RSS parsed: {feed_cfg['name']} entries={total} kept={len(rows)} skipped_no_date={skipped_no_date} sec={dt:.2f}")
+    return rows
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+session = build_session()
+
+def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
+    t0 = time.perf_counter()
+    r = session.get(
+        API_URL,
+        params={"language": LANG, "limit": limit, "sort": "desc"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    rows = [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
+    dt = time.perf_counter() - t0
+    log(f"API releases: {acronym} fetched={len(data)} kept={len(rows)} sec={dt:.2f}")
+    return rows
+
+def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Response]:
+    if not items:
+        log("POST skipped. items=0")
+        return None
+
+    if DRY_RUN or (POST_ENABLED is False):
+        log(f"POST skipped. DRY_RUN={int(DRY_RUN)} POST_ENABLED={int(POST_ENABLED)} items={len(items)}")
+        log("Payload preview: " + json.dumps({"items": items}, ensure_ascii=False)[:900])
+        return None
+
+    if RAILWAY_API_KEY == "":
+        log("POST skipped. RAILWAY_API_KEY missing")
+        return None
+
+    headers = {"x-api-key": RAILWAY_API_KEY, "Content-Type": "application/json"}
+    payload = {"items": items}
+
+    log(f"POST start: url={FEED_POST_URL} items={len(items)}")
+    r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=30)
+    log(f"POST done: status={r.status_code} body_preview={(r.text or '')[:220]}")
+    r.raise_for_status()
+    return r
+
 # ============================================================
-# SCORE RULES
+# SCORING RULES
 # ============================================================
 
 def load_score_rules() -> Dict[str, Any]:
@@ -250,167 +438,10 @@ def normalize_places(text: str) -> List[str]:
     return cities[:8]
 
 # ============================================================
-# OPENAI CLIENT
+# OPENAI ENRICHMENT
 # ============================================================
 
-_openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# ============================================================
-# HTML STRIP
-# ============================================================
-
-TAG_RE = re.compile(r"<[^>]+>")
-
-def strip_html(s: str) -> str:
-    s = s or ""
-    s = s.replace("&mdash;", " - ")
-    s = s.replace("&ndash;", " - ")
-    s = s.replace("&nbsp;", " ")
-    s = TAG_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def make_excerpt(item: Dict[str, Any], max_len: int = 420) -> str:
-    raw = item.get("content_lead") or item.get("content_subtitle") or ""
-    text = strip_html(raw)
-    if not text:
-        return ""
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1].rstrip() + "…"
-
-# ============================================================
-# FEED NORMALIZATION
-# ============================================================
-
-def parse_ministry_from_url(url: str) -> str:
-    for p in url.split("/"):
-        key = p.lower()
-        if key in PATH_TO_ACRONYM:
-            return PATH_TO_ACRONYM[key]
-    raise ValueError(f"Unknown ministry in url: {url}")
-
-def build_public_url(item: Dict[str, Any]) -> str:
-    rid = item.get("release_id_translated") or item.get("id")
-    slug = item.get("slug") or ""
-    return f"https://news.ontario.ca/{LANG}/release/{rid}/{slug}"
-
-def to_row(item: Dict[str, Any]) -> Dict[str, Any]:
-    rid = item.get("release_id_translated") or item.get("id")
-    collected_at = datetime.now(timezone.utc).isoformat()
-    return {
-        "id": rid,
-        "date": item.get("release_date_time") or "",
-        "date_display": item.get("release_date_time_formatted") or "",
-        "collected_at": collected_at,
-        "type": item.get("release_type_name") or item.get("release_type_label") or "",
-        "ministry_acronym": (item.get("ministry_acronym") or "").strip(),
-        "ministry_name": item.get("ministry_name") or "",
-        "title": item.get("clean_title") or item.get("content_title") or "",
-        "excerpt": make_excerpt(item, max_len=420),
-        "url": build_public_url(item),
-        "source": "ontario_newsroom_api",
-    }
-
-def load_existing() -> Dict[str, Any]:
-    if not os.path.exists(OUT_JSON):
-        return {"items": []}
-    with open(OUT_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def rss_id(entry: Dict[str, Any]) -> str:
-    base = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title", "")
-    return hashlib.sha256(str(base).encode("utf-8")).hexdigest()
-
-def _iso_z_from_dt(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt = dt.astimezone(timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
-
-def _try_parse_any_date_string(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-
-    try:
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return _iso_z_from_dt(dt)
-        dt = datetime.fromisoformat(s)
-        return _iso_z_from_dt(dt)
-    except Exception:
-        pass
-
-    try:
-        dt = parsedate_to_datetime(s)
-        return _iso_z_from_dt(dt)
-    except Exception:
-        return ""
-
-def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
-    if getattr(e, "published_parsed", None):
-        dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        return {"iso": _iso_z_from_dt(dt), "display": e.get("published", "") or ""}
-
-    if getattr(e, "updated_parsed", None):
-        dt = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
-        return {"iso": _iso_z_from_dt(dt), "display": e.get("updated", "") or ""}
-
-    raw = e.get("published") or e.get("updated") or ""
-    parsed = _try_parse_any_date_string(raw)
-    if parsed:
-        return {"iso": parsed, "display": raw}
-
-    for k in ["dc_date", "dc:date", "date", "pubDate"]:
-        raw2 = e.get(k, "") if isinstance(e, dict) else ""
-        parsed2 = _try_parse_any_date_string(str(raw2))
-        if parsed2:
-            return {"iso": parsed2, "display": str(raw2)}
-
-    return {"iso": "", "display": ""}
-
-def parse_rss_feed(feed_cfg: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int, int]:
-    """
-    Returns: (rows, total_entries_seen, rows_emitted)
-    """
-    feed = feedparser.parse(feed_cfg["url"])
-    total_entries = len(getattr(feed, "entries", []) or [])
-    rows: List[Dict[str, Any]] = []
-    collected_at = datetime.now(timezone.utc).isoformat()
-
-    for e in getattr(feed, "entries", []):
-        rid = rss_id(e)
-        pub = _extract_published_from_entry(e)
-        dt_iso = pub["iso"]
-        dt_display = pub["display"]
-
-        if SKIP_RSS_IF_NO_PUBLISHED and not dt_iso:
-            continue
-
-        summary = strip_html(e.get("summary", "") or e.get("description", "") or "")
-        if summary and len(summary) > 420:
-            summary = summary[:419].rstrip() + "…"
-
-        rows.append({
-            "id": rid,
-            "date": dt_iso,
-            "date_display": dt_display,
-            "collected_at": collected_at,
-            "type": feed_cfg["type"],
-            "ministry_acronym": feed_cfg.get("acronym", "RSS"),
-            "ministry_name": feed_cfg["name"],
-            "title": strip_html(e.get("title", "")),
-            "excerpt": summary,
-            "url": e.get("link", ""),
-            "source": feed_cfg.get("source", "rss"),
-        })
-
-    return rows, total_entries, len(rows)
-
-# ============================================================
-# ENRICHMENT
-# ============================================================
+_openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0) if OPENAI_API_KEY else None
 
 def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     title = str(row.get("title") or "").strip()
@@ -441,7 +472,6 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
     payload = {
         "allowed_topics": TOPICS,
         "domain_signals": DOMAIN_SIGNALS,
-        "place_map": [{"raw": "Lambeth", "city": "London"}, {"raw": "Etobicoke", "city": "Toronto"}],
         "output_schema": {
             "ai_summary_1s": "string, 1 sentence",
             "ai_why_lifelabs_cares": "string, 1 sentence, business impact",
@@ -457,6 +487,7 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
     }
 
     try:
+        t0 = time.perf_counter()
         resp = _openai_client.chat.completions.create(
             model=ENRICH_MODEL,
             messages=[
@@ -465,6 +496,7 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
             ],
             temperature=0.1,
         )
+        row["ai_latency_sec"] = round(time.perf_counter() - t0, 3)
 
         raw = resp.choices[0].message.content or ""
         data = json.loads(raw)
@@ -517,31 +549,47 @@ def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[s
 
     return row
 
-def enrich_in_batches(rows: List[Dict[str, Any]], rules: Dict[str, Any], label: str):
+def enrich_in_batches(rows: List[Dict[str, Any]], rules: Dict[str, Any], label: str) -> List[Dict[str, Any]]:
     total = len(rows)
     if total == 0:
-        return
+        return rows
 
-    log(f"OpenAI enrichment start: {label}. items={total}. batch_size={ENRICH_BATCH_SIZE}. model={ENRICH_MODEL}. enabled={ENRICH_ENABLED}")
+    log(f"Enrich start: label={label} total={total} batch_size={ENRICH_BATCH_SIZE} model={ENRICH_MODEL} enabled={int(ENRICH_ENABLED)}")
 
-    done = 0
-    batch_idx = 0
-    for start in range(0, total, ENRICH_BATCH_SIZE):
-        end = min(start + ENRICH_BATCH_SIZE, total)
-        batch_idx += 1
-        log(f"Enrich batch {batch_idx}. items {start+1}-{end} of {total}")
+    t_all = time.perf_counter()
+    out: List[Dict[str, Any]] = []
+
+    batches = (total + ENRICH_BATCH_SIZE - 1) // ENRICH_BATCH_SIZE
+    for b in range(batches):
+        start = b * ENRICH_BATCH_SIZE
+        end = min(total, start + ENRICH_BATCH_SIZE)
+        log(f"Enrich batch: {b+1}/{batches} rows={start+1}-{end}")
 
         for i in range(start, end):
-            rows[i] = enrich_row_with_openai(rows[i], rules)
-            done += 1
+            t0 = time.perf_counter()
+            out_row = enrich_row_with_openai(rows[i], rules)
+            out.append(out_row)
 
-            if done % 10 == 0 or done == total:
-                log(f"Enrich progress: {done}/{total}")
+            elapsed = time.perf_counter() - t0
+            score = out_row.get("ai_score_0_100")
+            lat = out_row.get("ai_latency_sec")
+            err = out_row.get("ai_error")
+            if err:
+                log(f"Enrich item: {i+1}/{total} sec={elapsed:.2f} api_sec={lat} score={score} error=1")
+            else:
+                log(f"Enrich item: {i+1}/{total} sec={elapsed:.2f} api_sec={lat} score={score} error=0")
 
-    log(f"OpenAI enrichment done: {label}. items={total}")
+        done = end
+        rate = done / max(0.001, (time.perf_counter() - t_all))
+        remaining = total - done
+        eta_sec = remaining / max(0.001, rate)
+        log(f"Enrich checkpoint: done={done}/{total} rate_items_sec={rate:.3f} eta_min={eta_sec/60.0:.1f}")
+
+    log(f"Enrich done: total={total} sec={(time.perf_counter()-t_all):.2f}")
+    return out
 
 # ============================================================
-# FEED ITEM FORMAT
+# FEED ITEM OUTPUT
 # ============================================================
 
 def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -603,97 +651,38 @@ def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "ai_entities": row.get("ai_entities"),
             "ai_enriched_at": row.get("ai_enriched_at"),
             "ai_model": row.get("ai_model"),
+            "ai_latency_sec": row.get("ai_latency_sec"),
             "ai_error": row.get("ai_error"),
         },
     }
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
-
-def build_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-session = build_session()
-
-def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
-    r = session.get(API_URL, params={"language": LANG, "limit": limit, "sort": "desc"}, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
-
-def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Response]:
-    if not items:
-        log("POST: no items. skip")
-        return None
-
-    if DRY_RUN or (POST_ENABLED is False):
-        log("POST skipped (DRY_RUN or POST_ENABLED=0)")
-        log(f"FEED_POST_URL: {FEED_POST_URL}")
-        log(f"Items: {len(items)}")
-        log("Payload preview: " + json.dumps({"items": items[:3]}, ensure_ascii=False)[:900])
-        return None
-
-    if RAILWAY_API_KEY == "":
-        log("RAILWAY_API_KEY absent. POST skipped.")
-        return None
-
-    headers = {"x-api-key": RAILWAY_API_KEY, "Content-Type": "application/json"}
-    payload = {"items": items}
-
-    log(f"POST start. url={FEED_POST_URL}. items={len(items)}")
-    r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=30)
-    log(f"Feed POST status: {r.status_code}")
-    log("Feed POST body preview: " + (r.text or "")[:900])
-    r.raise_for_status()
-    log("POST done")
-    return r
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    log("RUN START")
-    log(f"ENV POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} ENRICH_ENABLED={int(ENRICH_ENABLED)} RESET_STORE={int(RESET_STORE)} REENRICH_ALL={int(REENRICH_ALL)}")
-    log(f"ENV ENRICH_MODEL={ENRICH_MODEL} ENRICH_BATCH_SIZE={ENRICH_BATCH_SIZE}")
-    log(f"OUT_JSON will write to: {os.path.abspath(OUT_JSON)}")
-    log("Lovable gets data from your feed endpoint. This script posts items to FEED_POST_URL.")
+    log("Run start")
 
     if RESET_STORE and os.path.exists(OUT_JSON):
         os.remove(OUT_JSON)
-        log("RESET_STORE=1 removed combined_feed.json")
+        log(f"Store reset: removed {OUT_JSON}")
 
     rules = load_score_rules()
-    log(f"Loaded scoring rules. boosts={len(rules.get('boosts', []))} penalties={len(rules.get('penalties', []))} file={SCORE_RULES_PATH}")
+    log(f"Rules loaded: boosts={len(rules.get('boosts', []))} penalties={len(rules.get('penalties', []))}")
 
     store = load_existing()
     existing_items = store.get("items", [])
     seen: Set[str] = {str(x.get("id")) for x in existing_items if x.get("id")}
-    log(f"Store loaded. existing_items={len(existing_items)} seen_ids={len(seen)}")
+    log(f"Store loaded: existing_items={len(existing_items)} seen_ids={len(seen)}")
+    log(f"Store path: {os.path.abspath(OUT_JSON)}")
 
     new_rows: List[Dict[str, Any]] = []
 
     # A1) Ontario Newsroom API
-    log("Fetch Ontario Newsroom API start")
+    log("Fetch start: Ontario Newsroom API")
     acronyms = [parse_ministry_from_url(u) for u in FEED_URLS]
     for acr in acronyms:
         items = fetch_releases_for_ministry(acr)
-        added = 0
-        log(f"Newsroom {acr} fetched {len(items)} items")
         for it in items:
             row = to_row(it)
             if not row.get("id"):
@@ -703,60 +692,50 @@ def main():
                 continue
             seen.add(rid)
             new_rows.append(row)
-            added += 1
-        log(f"Newsroom {acr} added {added} new items")
-    log("Fetch Ontario Newsroom API done")
+    log(f"Fetch done: Ontario Newsroom API new_rows_added={len(new_rows)}")
 
     # A2) Regulatory Registry RSS
-    log("Fetch Regulatory Registry RSS start")
+    log("Fetch start: Regulatory Registry RSS")
+    before = len(new_rows)
     for cfg in REGISTRY_FEEDS:
         cfg2 = dict(cfg)
         cfg2["acronym"] = "REG"
         cfg2["source"] = "regulatory_registry_rss"
-        rss_items, total_entries, emitted = parse_rss_feed(cfg2)
-        added = 0
-        log(f"RSS {cfg2['name']} total_entries={total_entries} emitted={emitted}")
+        rss_items = parse_rss_feed(cfg2)
         for row in rss_items:
             rid = str(row.get("id") or "")
-            if rid == "":
-                continue
-            if rid in seen:
-                continue
-            seen.add(rid)
-            new_rows.append(row)
-            added += 1
-        log(f"RSS {cfg2['name']} added {added} new items")
-    log("Fetch Regulatory Registry RSS done")
+            if rid and (rid not in seen):
+                seen.add(rid)
+                new_rows.append(row)
+    log(f"Fetch done: Regulatory RSS new_rows_added={len(new_rows)-before}")
 
     # A3) Extra RSS feeds
-    log("Fetch Extra RSS start")
+    log("Fetch start: Extra RSS")
+    before = len(new_rows)
     for cfg in EXTRA_RSS_FEEDS:
         cfg2 = dict(cfg)
         cfg2["acronym"] = "RSS"
         cfg2["source"] = "extra_rss"
-        rss_items, total_entries, emitted = parse_rss_feed(cfg2)
-        added = 0
-        log(f"RSS {cfg2['name']} total_entries={total_entries} emitted={emitted}")
+        rss_items = parse_rss_feed(cfg2)
         for row in rss_items:
             rid = str(row.get("id") or "")
-            if rid == "":
-                continue
-            if rid in seen:
-                continue
-            seen.add(rid)
-            new_rows.append(row)
-            added += 1
-        log(f"RSS {cfg2['name']} added {added} new items")
-    log("Fetch Extra RSS done")
+            if rid and (rid not in seen):
+                seen.add(rid)
+                new_rows.append(row)
+    log(f"Fetch done: Extra RSS new_rows_added={len(new_rows)-before}")
 
-    log(f"COMBINE done. new_rows={len(new_rows)} existing_items={len(existing_items)} total_after_store={(len(existing_items) + len(new_rows))}")
+    log(f"Total new_rows before caps: {len(new_rows)}")
 
-    # Enrich only new rows (default) in visible buckets
-    enrich_in_batches(new_rows, rules, label="new_rows")
+    if MAX_ENRICH_PER_RUN > 0 and len(new_rows) > MAX_ENRICH_PER_RUN:
+        log(f"MAX_ENRICH_PER_RUN trim: {len(new_rows)} -> {MAX_ENRICH_PER_RUN}")
+        new_rows = new_rows[:MAX_ENRICH_PER_RUN]
 
-    # Optional re-enrich all stored items (also in buckets)
+    # Enrich new rows
+    new_rows = enrich_in_batches(new_rows, rules, label="new_rows")
+
+    # Optional re-enrich all
     if REENRICH_ALL and existing_items:
-        enrich_in_batches(existing_items, rules, label="existing_items (REENRICH_ALL)")
+        existing_items = enrich_in_batches(existing_items, rules, label="existing_items")
 
     # Store
     if new_rows:
@@ -778,24 +757,16 @@ def main():
             ensure_ascii=False,
         )
 
-    log("STORE write done")
-    log(f"combined_feed.json path: {os.path.abspath(OUT_JSON)}")
-    log(f"combined_feed.json exists: {os.path.exists(OUT_JSON)}")
-    if os.path.exists(OUT_JSON):
-        log(f"combined_feed.json size_bytes: {os.path.getsize(OUT_JSON)}")
+    log(f"Store write done: items={len(existing_items)} file={os.path.abspath(OUT_JSON)} bytes={os.path.getsize(OUT_JSON) if os.path.exists(OUT_JSON) else 0}")
 
     # POST only new items
     feed_items_raw = [row_to_feed_item(r) for r in new_rows]
     feed_items = [x for x in feed_items_raw if x is not None]
-
-    log("FEED build done")
-    log(f"New feed items prepared: {len(feed_items)}")
-    if feed_items:
-        log("Feed item sample: " + json.dumps(feed_items[0], ensure_ascii=False)[:900])
+    log(f"Feed items prepared: new_feed_items={len(feed_items)}")
 
     post_to_feed_function(feed_items)
 
-    log("RUN DONE")
+    log("Run done")
     sys.stdout.flush()
 
 if __name__ == "__main__":
