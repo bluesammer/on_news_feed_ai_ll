@@ -25,6 +25,12 @@
 # main.py
 # RSS + Ontario News API -> store (Supabase Storage) -> enrich N per run -> post full store to Supabase Edge Function
 # Built for Railway logs. DEBUG=1 prints step-by-step.
+#
+# Change in this version:
+# - Removes ONTARIO_CITIES list.
+# - ChatGPT returns a single Ontario city name in "city".
+# - If text mentions a region/county/district, ChatGPT converts it to the main city (largest/admin centre).
+# - Code stores ai_city and preserves it across runs.
 
 import os
 import sys
@@ -123,26 +129,28 @@ TOPICS = [
     "Consultations and Draft Regulations",
     "Privacy, PHIPA, and IPC Decisions",
     "Inspections, Compliance, and Quality",
+    "Unrelated",
 ]
+ALLOWED_TOPICS = set(TOPICS)
 
+# City rules:
+# - Return a single Ontario city name in "city".
+# - If text mentions a region/county/district/municipality, convert to its main city
+#   (largest city or admin centre). Example: "Durham Region" -> "Oshawa".
+# - If multiple cities appear, return the most relevant, else the largest.
+# - If no Ontario city fits, return "".
 ENRICH_SYSTEM = (
     "Return ONLY valid JSON. No markdown. No code fences. No extra text.\n"
-    "Keys: summary, topic, score, keywords.\n"
+    "Keys: summary, topic, score, keywords, city.\n"
     "summary: 1 to 2 short sentences.\n"
     "topic must match an allowed topic.\n"
     "score must be an integer 0 to 100.\n"
     "keywords must be an array of 3 short strings.\n"
+    "city must be a single Ontario city name string, or empty string.\n"
+    "If the text mentions a county/region/district, convert it to the main Ontario city.\n"
 )
 
 MONEY_RE = re.compile(r"(?i)\$[\s]*([\d]{1,3}(?:,[\d]{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
-
-# Simple Ontario city list. Add more over time.
-ONTARIO_CITIES = [
-    "Toronto","Ottawa","Hamilton","London","Kitchener","Waterloo","Guelph","Windsor",
-    "Kingston","Sudbury","Thunder Bay","Barrie","Peterborough","Sarnia","Niagara Falls",
-    "St. Catharines","Mississauga","Brampton","Markham","Vaughan","Richmond Hill",
-    "Oakville","Burlington","Whitby","Oshawa","Pickering","Ajax","Newmarket",
-]
 
 
 # =========================
@@ -210,6 +218,19 @@ def is_too_old(published_dt: Optional[datetime]) -> bool:
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
     return published_dt < cutoff
 
+def clamp_0_100(x: int) -> int:
+    if x < 0:
+        return 0
+    if x > 100:
+        return 100
+    return x
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 def extract_money_values(text: str) -> List[str]:
     vals: List[str] = []
     for m in MONEY_RE.findall(text or ""):
@@ -218,20 +239,43 @@ def extract_money_values(text: str) -> List[str]:
             vals.append(v)
     return vals[:10]
 
-def extract_cities(text: str) -> List[str]:
-    t = (text or "").lower()
-    out: List[str] = []
-    for c in ONTARIO_CITIES:
-        if c.lower() in t and c not in out:
-            out.append(c)
-    # Quick fallback: patterns like "City of X"
-    m = re.findall(r"(?i)\bcity of ([a-z][a-z\s\.\-]{2,40})\b", text or "")
-    for x in m:
-        x2 = " ".join(x.strip().split())
-        x2 = x2.title()
-        if x2 not in out and len(out) < 10:
-            out.append(x2)
-    return out[:10]
+def extract_json_object(text: str) -> str:
+    t = (text or "").strip()
+    if t == "":
+        return ""
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return t[start:end + 1]
+    return ""
+
+def heuristic_city_hint(text: str) -> str:
+    """
+    Cheap hint for the model.
+    Finds "City of X", "Town of X", "Region of X", "County of X", etc.
+    Returns a short hint string.
+    """
+    s = text or ""
+    pats = [
+        r"(?i)\bcity of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\btown of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bmunicipality of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bregion of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bregional municipality of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bcounty of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bdistrict of\s+([a-z][a-z\s\.\-]{2,60})\b",
+        r"(?i)\bmunicipal region of\s+([a-z][a-z\s\.\-]{2,60})\b",
+    ]
+    hits: List[str] = []
+    for p in pats:
+        found = re.findall(p, s)
+        for x in found[:3]:
+            x2 = " ".join(str(x).strip().split())
+            if x2:
+                hits.append(x2)
+    if not hits:
+        return ""
+    return "Location mentions: " + "; ".join(hits[:5])
 
 
 # =========================
@@ -308,6 +352,7 @@ def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, An
 def collect_items() -> List[Dict[str, Any]]:
     dbg("STEP fetch.start")
     items: List[Dict[str, Any]] = []
+
     a = fetch_ontario_news_pages()
     dbg(f"STEP fetch.ontario_api items={len(a)}")
     items.extend(a)
@@ -407,23 +452,25 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
     text = (title + "\n\n" + summary + "\n\n" + link).strip()
 
     money_vals = extract_money_values(text)
-    cities = extract_cities(text)
+    loc_hint = heuristic_city_hint(text)
 
     user_prompt = (
         "Return ONLY a JSON object.\n"
-        "Keys: summary, topic, score, keywords.\n"
+        "Keys: summary, topic, score, keywords, city.\n"
         "summary: 1 to 2 short sentences.\n"
         "topic must be one of:\n"
         + "\n".join(TOPICS)
         + "\n"
         "score integer 0 to 100.\n"
         "keywords array length 3.\n"
-        "Scoring rules:\n"
-        "80-100 direct Ontario lab policy, billing, test ordering, PHIPA, IPC, licensing, scope.\n"
-        "40-79 adjacent healthcare policy, privacy, LTC, primary care, POCT.\n"
-        "0-39 unrelated.\n"
+        "city rules:\n"
+        "Return ONE Ontario city name.\n"
+        "If text has a region/county/district, convert it to the main Ontario city (largest/admin centre).\n"
+        "If multiple cities, return the most relevant.\n"
+        "If no Ontario city fits, return empty string.\n"
         "\n"
-        "Text:\n"
+        + (loc_hint + "\n" if loc_hint else "")
+        + "Text:\n"
         + text[:6000]
     )
 
@@ -443,34 +490,49 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
         print(raw[:1200])
         dbg("STEP enrich.model_raw_end")
 
+    j = extract_json_object(raw)
     try:
-        data = json.loads(raw)
+        data = json.loads(j)
     except Exception as e:
         item["ai_summary"] = ""
-        item["ai_topic"] = ""
+        item["ai_topic"] = "Unrelated"
         item["ai_score"] = 0
         item["ai_keywords"] = []
+        item["ai_city"] = ""
         item["ai_error"] = f"json_parse_error: {e}"
         item["money_values"] = money_vals
-        item["cities"] = cities
         item["enriched_at"] = utc_iso_z()
         return item
 
-    item["ai_summary"] = str(data.get("summary") or "").strip()
-    item["ai_topic"] = str(data.get("topic") or "").strip()
+    ai_summary = str(data.get("summary") or "").strip()
+    ai_topic = str(data.get("topic") or "").strip()
+    ai_score = clamp_0_100(safe_int(data.get("score"), 0))
 
-    try:
-        item["ai_score"] = int(data.get("score") or 0)
-    except Exception:
-        item["ai_score"] = 0
+    if ai_topic not in ALLOWED_TOPICS:
+        ai_topic = "Unrelated"
+        ai_score = 0
+    if ai_topic == "Unrelated":
+        ai_score = 0
 
     kws = data.get("keywords") or []
     if isinstance(kws, list) is False:
         kws = []
-    item["ai_keywords"] = [str(x).strip() for x in kws][:3]
+    ai_keywords = [str(x).strip() for x in kws][:3]
+
+    # Single city string
+    ai_city = str(data.get("city") or "").strip()
+    # Light cleanup
+    ai_city = re.sub(r"\s+", " ", ai_city).strip()
+    if len(ai_city) > 80:
+        ai_city = ai_city[:80].strip()
+
+    item["ai_summary"] = ai_summary
+    item["ai_topic"] = ai_topic
+    item["ai_score"] = ai_score
+    item["ai_keywords"] = ai_keywords
+    item["ai_city"] = ai_city
     item["ai_error"] = ""
     item["money_values"] = money_vals
-    item["cities"] = cities
     item["enriched_at"] = utc_iso_z()
     return item
 
@@ -514,6 +576,17 @@ def post_full_store(items: List[Dict[str, Any]]) -> None:
 # =========================
 # STORE LOGIC
 # =========================
+
+ENRICH_FIELDS = [
+    "ai_summary",
+    "ai_topic",
+    "ai_score",
+    "ai_keywords",
+    "ai_city",
+    "ai_error",
+    "money_values",
+    "enriched_at",
+]
 
 def index_by_id(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     idx: Dict[str, Dict[str, Any]] = {}
@@ -577,7 +650,7 @@ def main() -> None:
 
         _id = stable_id(source, link, title)
 
-        item = {
+        base_item = {
             "id": _id,
             "feed_tag": FEED_TAG,
             "source": source,
@@ -592,14 +665,13 @@ def main() -> None:
 
         prev = existing_idx.get(_id)
         if prev:
-            # Keep prior enrichment fields if present
-            for k in ["ai_summary","ai_topic","ai_score","ai_keywords","ai_error","money_values","cities","enriched_at"]:
-                if k in prev and k not in item:
-                    item[k] = prev[k]
-            existing_idx[_id] = {**prev, **item}
+            for k in ENRICH_FIELDS:
+                if k in prev:
+                    base_item[k] = prev.get(k)
+            existing_idx[_id] = {**prev, **base_item}
             merged += 1
         else:
-            existing_idx[_id] = item
+            existing_idx[_id] = base_item
             added += 1
 
     dbg(f"STEP normalize.done dropped_old={dropped_old} merged={merged} added={added}")
@@ -611,7 +683,6 @@ def main() -> None:
         all_items = all_items[:MAX_STORE_ITEMS]
         dbg(f"STEP store.trim to={MAX_STORE_ITEMS}")
 
-    # Debug sample per source
     if DEBUG and DEBUG_SAMPLE_PER_SOURCE > 0:
         dbg("STEP debug.sample_per_source")
         by_src: Dict[str, int] = {}
@@ -621,7 +692,6 @@ def main() -> None:
         for src, cnt in sorted(by_src.items(), key=lambda x: x[0].lower()):
             dbg(f"SRC {src} count={cnt}")
 
-    # Pick unenriched items for this run
     unenriched = [x for x in all_items if str(x.get("ai_summary") or "").strip() == ""]
     batch = unenriched[:MAX_ENRICH_ITEMS] if MAX_ENRICH_ITEMS > 0 else unenriched
     dbg(f"STEP enrich.plan store_items={len(all_items)} unenriched={len(unenriched)} batch={len(batch)}")
@@ -634,10 +704,8 @@ def main() -> None:
         for i, it in enumerate(batch, start=1):
             dbg(f"STEP enrich.item {i}/{len(batch)} src={it.get('source')} title={str(it.get('title') or '')[:70]}")
             updated = enrich_one(client, it)
-            # Write back into all_items by id
             existing_idx[updated["id"]] = updated
 
-    # Rebuild and sort after enrichment
     all_items = list(existing_idx.values())
     sort_newest(all_items)
     if len(all_items) > MAX_STORE_ITEMS:
@@ -663,7 +731,6 @@ def main() -> None:
     else:
         dbg("STEP store.remote_skip reason=STORE_REMOTE_ENABLED=0")
 
-    # Post full store so Lovable shows all rows
     post_full_store(all_items)
 
     log("RUN done")
