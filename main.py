@@ -7,18 +7,24 @@
 
 
 
-# In[ ]:
+# In[1]:
 
 
 
 
 
-# In[2]:
+# In[3]:
+
+
+
+
+
+# In[4]:
 
 
 # main.py
 # News feed + OpenAI enrichment + keyword scoring rules
-# Stores combined_feed_ai.json in Supabase Storage so cron runs resume correctly
+# Stores combined_feed_<tag>.json in Supabase Storage so cron runs resume correctly
 
 import os
 import sys
@@ -26,7 +32,7 @@ import json
 import re
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Set, Optional
+from typing import Dict, List, Any, Optional
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -34,6 +40,19 @@ import feedparser
 from requests.adapters import HTTPAdapter, Retry
 
 from openai import OpenAI
+
+# ============================================================
+# OPENAI KEY SOURCE
+# ============================================================
+# Option A: Hard code here for local runs. Leave "" on Railway.
+# Option B: Set OPENAI_API_KEY in Railway Variables.
+HARDCODED_OPENAI_KEY = ""  # paste sk-proj-... here, or leave blank
+
+_env_key = os.getenv("OPENAI_API_KEY", "").strip()
+_hard_key = (HARDCODED_OPENAI_KEY or "").strip()
+
+if _env_key == "" and _hard_key != "":
+    os.environ["OPENAI_API_KEY"] = _hard_key
 
 # ============================================================
 # CONFIG
@@ -83,14 +102,25 @@ EXTRA_RSS_FEEDS = [
     },
 ]
 
-OUT_JSON_LOCAL = "combined_feed_ai.json"
+FEED_TAG = os.getenv("FEED_TAG", "ai").strip()
+OUT_JSON_LOCAL = os.getenv("OUT_JSON_LOCAL", f"combined_feed_{FEED_TAG}.json").strip()
 
 FEED_POST_URL = os.getenv(
     "FEED_POST_URL",
     "https://tcgdugdhwtbyeygdqdob.supabase.co/functions/v1/feed",
 ).strip()
 
-RAILWAY_API_KEY = os.getenv("RAILWAY_API_KEY", "").strip()
+def _default_ai_feed_url(base: str) -> str:
+    b = (base or "").strip()
+    if b.endswith("/feed"):
+        return b[:-5] + "/feed_ai"
+    return b.rstrip("/") + "_ai"
+
+FEED_POST_URL_AI = os.getenv("FEED_POST_URL_AI", _default_ai_feed_url(FEED_POST_URL)).strip()
+
+POST_TO_MAIN_FEED = os.getenv("POST_TO_MAIN_FEED", "0").strip() == "1"
+POST_TO_AI_FEED = os.getenv("POST_TO_AI_FEED", "1").strip() == "1"
+POST_ID_SUFFIX = os.getenv("POST_ID_SUFFIX", "1").strip() == "1"
 
 POST_ENABLED = os.getenv("POST_ENABLED", "0").strip() == "1"
 DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
@@ -109,7 +139,11 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50").strip())
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "").strip()
-SUPABASE_OBJECT_PATH = os.getenv("SUPABASE_OBJECT_PATH", "feeds/combined_feed_ai.json").strip()
+
+SUPABASE_OBJECT_PATH = os.getenv(
+    "SUPABASE_OBJECT_PATH",
+    f"feeds/combined_feed_{FEED_TAG}.json",
+).strip()
 
 STORE_REMOTE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET and SUPABASE_OBJECT_PATH)
 
@@ -191,6 +225,10 @@ ENRICH_SYSTEM = (
     "Avoid topic 'Other'. Use only allowed topics.\n"
 )
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     print(f"[{ts}] {msg}")
@@ -205,6 +243,10 @@ def clamp_0_100(x: int) -> int:
     if x > 100:
         return 100
     return x
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
 def build_session() -> requests.Session:
     s = requests.Session()
@@ -225,11 +267,21 @@ def build_session() -> requests.Session:
 session = build_session()
 
 # ============================================================
+# OPENAI CLIENT
+# ============================================================
+
+def get_openai_client() -> Optional[OpenAI]:
+    if ENRICH_ENABLED is False:
+        return None
+    if OPENAI_API_KEY == "":
+        raise RuntimeError("Missing OPENAI_API_KEY. Set Railway variable, or set HARDCODED_OPENAI_KEY in main.py.")
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+# ============================================================
 # SUPABASE STORAGE HELPERS
 # ============================================================
 
 def supabase_object_url() -> str:
-    # Authenticated Storage endpoint
     return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{SUPABASE_OBJECT_PATH}"
 
 def supabase_headers_json() -> Dict[str, str]:
@@ -268,11 +320,9 @@ def load_store_remote() -> Dict[str, Any]:
 def save_store_remote(store: Dict[str, Any]) -> None:
     if STORE_REMOTE_ENABLED is False:
         return
-
     url = supabase_object_url()
     h = supabase_headers_json()
     payload = json.dumps(store, ensure_ascii=False).encode("utf-8")
-
     r = session.put(url, headers=h, data=payload, timeout=30)
     r.raise_for_status()
 
@@ -329,524 +379,323 @@ def normalize_places(text: str) -> List[str]:
     t = (text or "").lower()
     cities: List[str] = []
     for raw, city in PLACE_MAP.items():
-        if raw in t and city not in cities:
+        if raw in t and (city in cities) is False:
             cities.append(city)
-    return cities[:8]
+    return cities[:10]
+
+# ============================================================
+# FEED HELPERS
+# ============================================================
+
+def safe_parse_dt(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def stable_id(*parts: str) -> str:
+    raw = "|".join([p.strip() for p in parts if p is not None])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        r = session.get(API_URL, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            items = data["items"]
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        for it in items:
+            if isinstance(it, dict) is False:
+                continue
+            title = str(it.get("title") or "").strip()
+            url = str(it.get("url") or it.get("link") or "").strip()
+            published = str(it.get("published") or it.get("pubDate") or it.get("date") or "").strip()
+            if title == "" and url == "":
+                continue
+            out.append(
+                {
+                    "source": "Ontario News API",
+                    "type": "Ontario Release",
+                    "title": title,
+                    "link": url,
+                    "published_raw": published,
+                    "summary": str(it.get("summary") or it.get("description") or "").strip(),
+                }
+            )
+    except Exception as e:
+        log(f"Ontario API fetch error: {e}")
+    return out
+
+def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        parsed = feedparser.parse(url)
+        for e in (parsed.entries or []):
+            title = str(getattr(e, "title", "") or "").strip()
+            link = str(getattr(e, "link", "") or "").strip()
+            summary = str(getattr(e, "summary", "") or getattr(e, "description", "") or "").strip()
+            published = str(getattr(e, "published", "") or getattr(e, "updated", "") or "").strip()
+
+            if SKIP_RSS_IF_NO_PUBLISHED and published == "":
+                continue
+
+            out.append(
+                {
+                    "source": source_name,
+                    "type": source_type,
+                    "title": title,
+                    "link": link,
+                    "published_raw": published,
+                    "summary": summary,
+                }
+            )
+    except Exception as e:
+        log(f"RSS fetch error for {source_name}: {e}")
+    return out
+
+def collect_items() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+
+    items.extend(fetch_ontario_news_pages())
+
+    for u in FEED_URLS:
+        # For these, source name comes from URL path token
+        token = u.rstrip("/").split("/")[-2] if "/" in u.rstrip("/") else u
+        src = PATH_TO_ACRONYM.get(token, token.upper())
+        items.extend(fetch_rss(u, src, "Ontario RSS"))
+
+    for f in REGISTRY_FEEDS:
+        items.extend(fetch_rss(f["url"], f["name"], f["type"]))
+
+    for f in EXTRA_RSS_FEEDS:
+        items.extend(fetch_rss(f["url"], f["name"], f["type"]))
+
+    return items
 
 # ============================================================
 # ENRICHMENT
 # ============================================================
 
-_openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
+    title = str(item.get("title") or "")
+    summary = str(item.get("summary") or "")
+    link = str(item.get("link") or "")
+    text = (title + "\n\n" + summary + "\n\n" + link).strip()
 
-def enrich_row_with_openai(row: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
-    title = str(row.get("title") or "").strip()
-    excerpt = str(row.get("excerpt") or "").strip()
-    source = str(row.get("ministry_name") or row.get("source") or "").strip()
-    url = str(row.get("url") or "").strip()
+    money_vals = extract_money_values(text)
+    places = normalize_places(text)
 
-    blob = f"{title}\n\n{excerpt}\n\nSource: {source}\nURL: {url}"
-
-    money_backup = extract_money_values(blob)
-    cities_backup = normalize_places(blob)
-
-    row["ai_model"] = ENRICH_MODEL
-    row["ai_enriched_at"] = utc_iso_z()
-
-    if ENRICH_ENABLED is False or _openai_client is None:
-        row["ai_summary_1s"] = title[:220]
-        row["ai_why_lifelabs_cares"] = ""
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
-        row["ai_score_reason"] = "Enrichment disabled"
-        row["ai_topics"] = []
-        row["ai_dollar_values"] = money_backup
-        row["ai_city_labels"] = cities_backup
-        row["ai_signals_found"] = []
-        row["ai_entities"] = []
-        return row
-
-    payload = {
-        "allowed_topics": TOPICS,
-        "domain_signals": DOMAIN_SIGNALS,
-        "output_schema": {
-            "ai_summary_1s": "string, 1 sentence",
-            "ai_why_lifelabs_cares": "string, 1 sentence, business impact",
-            "ai_score_0_100": "int 0-100",
-            "ai_score_reason": "string, short",
-            "ai_topics": "array 1-3 from allowed_topics",
-            "ai_dollar_values": "array of strings",
-            "ai_city_labels": "array of Ontario city labels",
-            "ai_signals_found": "array of strings from domain_signals",
-            "ai_entities": "array of strings",
-        },
-        "item": {
-            "title": title,
-            "excerpt": excerpt,
-            "source": source,
-            "url": url,
-        },
-    }
+    prompt = (
+        "Return JSON with keys: topic, score, why, keywords.\n"
+        "topic must be one of these:\n"
+        + "\n".join(TOPICS)
+        + "\n"
+        "score must be 0 to 100.\n"
+        "keywords must be a list of 3 short strings.\n"
+        "why must be 1 to 2 short sentences.\n"
+        "\n"
+        "Text:\n"
+        + text[:6000]
+    )
 
     try:
-        resp = _openai_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=ENRICH_MODEL,
             messages=[
                 {"role": "system", "content": ENRICH_SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
+            temperature=0.2,
         )
-
-        raw = resp.choices[0].message.content or ""
+        raw = (resp.choices[0].message.content or "").strip()
         data = json.loads(raw)
 
-        row["ai_summary_1s"] = str(data.get("ai_summary_1s") or "").strip()
-        row["ai_why_lifelabs_cares"] = str(data.get("ai_why_lifelabs_cares") or "").strip()
+        topic = str(data.get("topic") or "").strip()
+        score = int(data.get("score") or 0)
+        why = str(data.get("why") or "").strip()
+        keywords = data.get("keywords") or []
+        if isinstance(keywords, list) is False:
+            keywords = []
 
-        base_score = int(data.get("ai_score_0_100") or 0)
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, base_score, rules)
-
-        row["ai_score_reason"] = str(data.get("ai_score_reason") or "").strip()
-
-        topics = data.get("ai_topics") or []
-        topics = [t for t in topics if t in TOPICS]
-        row["ai_topics"] = topics[:3]
-
-        dv = data.get("ai_dollar_values") or []
-        merged_dv: List[str] = []
-        for v in dv + money_backup:
-            v2 = str(v).strip()
-            if v2 and v2 not in merged_dv:
-                merged_dv.append(v2)
-        row["ai_dollar_values"] = merged_dv[:10]
-
-        cities = data.get("ai_city_labels") or []
-        merged_cities: List[str] = []
-        for c in cities + cities_backup:
-            c2 = str(c).strip()
-            if c2 and c2 not in merged_cities:
-                merged_cities.append(c2)
-        row["ai_city_labels"] = merged_cities[:8]
-
-        sigs = data.get("ai_signals_found") or []
-        row["ai_signals_found"] = [str(s).strip() for s in sigs if str(s).strip()][:12]
-
-        ents = data.get("ai_entities") or []
-        row["ai_entities"] = [str(e).strip() for e in ents if str(e).strip()][:12]
-
+        item["ai_topic"] = topic
+        item["ai_score"] = clamp_0_100(score)
+        item["ai_why"] = why
+        item["ai_keywords"] = [str(x).strip() for x in keywords][:3]
+        item["money_values"] = money_vals
+        item["places"] = places
+        item["enriched_at"] = utc_iso_z()
+        return item
     except Exception as e:
-        row["ai_error"] = str(e)
-        row["ai_summary_1s"] = title[:220]
-        row["ai_why_lifelabs_cares"] = ""
-        row["ai_score_0_100"] = apply_keyword_score_rules(blob, 0, rules)
-        row["ai_score_reason"] = "AI error"
-        row["ai_topics"] = []
-        row["ai_dollar_values"] = money_backup
-        row["ai_city_labels"] = cities_backup
-        row["ai_signals_found"] = []
-        row["ai_entities"] = []
-
-    return row
+        item["ai_topic"] = ""
+        item["ai_score"] = 0
+        item["ai_why"] = f"enrich_error: {e}"
+        item["ai_keywords"] = []
+        item["money_values"] = money_vals
+        item["places"] = places
+        item["enriched_at"] = utc_iso_z()
+        return item
 
 # ============================================================
-# FETCH + PARSE
+# POSTING
 # ============================================================
 
-TAG_RE = re.compile(r"<[^>]+>")
+def post_items(url: str, items: List[Dict[str, Any]]) -> None:
+    if POST_ENABLED is False:
+        log("POST disabled.")
+        return
+    if DRY_RUN:
+        log(f"DRY_RUN on. Skip post to {url}. Items={len(items)}")
+        return
 
-def strip_html(s: str) -> str:
-    s = s or ""
-    s = s.replace("&nbsp;", " ")
-    s = TAG_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def make_excerpt(item: Dict[str, Any], max_len: int = 420) -> str:
-    raw = item.get("content_lead") or item.get("content_subtitle") or ""
-    text = strip_html(raw)
-    if not text:
-        return ""
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1].rstrip() + "…"
-
-def parse_ministry_from_url(url: str) -> str:
-    for p in url.split("/"):
-        key = p.lower()
-        if key in PATH_TO_ACRONYM:
-            return PATH_TO_ACRONYM[key]
-    raise ValueError(f"Unknown ministry in url: {url}")
-
-def build_public_url(item: Dict[str, Any]) -> str:
-    rid = item.get("release_id_translated") or item.get("id")
-    slug = item.get("slug") or ""
-    return f"https://news.ontario.ca/{LANG}/release/{rid}/{slug}"
-
-def to_row(item: Dict[str, Any]) -> Dict[str, Any]:
-    rid = item.get("release_id_translated") or item.get("id")
-    collected_at = datetime.now(timezone.utc).isoformat()
-    return {
-        "id": rid,
-        "date": item.get("release_date_time") or "",
-        "date_display": item.get("release_date_time_formatted") or "",
-        "collected_at": collected_at,
-        "type": item.get("release_type_name") or item.get("release_type_label") or "",
-        "ministry_acronym": (item.get("ministry_acronym") or "").strip(),
-        "ministry_name": item.get("ministry_name") or "",
-        "title": item.get("clean_title") or item.get("content_title") or "",
-        "excerpt": make_excerpt(item, max_len=420),
-        "url": build_public_url(item),
-        "source": "ontario_newsroom_api",
-    }
-
-def rss_id(entry: Dict[str, Any]) -> str:
-    base = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title", "")
-    return hashlib.sha256(str(base).encode("utf-8")).hexdigest()
-
-def _iso_z_from_dt(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt = dt.astimezone(timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
-
-def _try_parse_any_date_string(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    try:
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return _iso_z_from_dt(dt)
-        dt = datetime.fromisoformat(s)
-        return _iso_z_from_dt(dt)
-    except Exception:
-        pass
-    try:
-        dt = parsedate_to_datetime(s)
-        return _iso_z_from_dt(dt)
-    except Exception:
-        return ""
-
-def _extract_published_from_entry(e: Dict[str, Any]) -> Dict[str, str]:
-    if getattr(e, "published_parsed", None):
-        dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        return {"iso": _iso_z_from_dt(dt), "display": e.get("published", "") or ""}
-
-    if getattr(e, "updated_parsed", None):
-        dt = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
-        return {"iso": _iso_z_from_dt(dt), "display": e.get("updated", "") or ""}
-
-    raw = e.get("published") or e.get("updated") or ""
-    parsed = _try_parse_any_date_string(raw)
-    if parsed:
-        return {"iso": parsed, "display": raw}
-
-    for k in ["dc_date", "dc:date", "date", "pubDate"]:
-        raw2 = e.get(k, "") if isinstance(e, dict) else ""
-        parsed2 = _try_parse_any_date_string(str(raw2))
-        if parsed2:
-            return {"iso": parsed2, "display": str(raw2)}
-
-    return {"iso": "", "display": ""}
-
-def parse_rss_feed(feed_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
-    log(f"RSS fetch start: {feed_cfg['name']} url={feed_cfg['url']}")
-    feed = feedparser.parse(feed_cfg["url"])
-    entries = getattr(feed, "entries", [])
-    log(f"RSS fetched: {feed_cfg['name']} entries={len(entries)}")
-
-    rows: List[Dict[str, Any]] = []
-    collected_at = datetime.now(timezone.utc).isoformat()
-
-    for e in entries:
-        rid = rss_id(e)
-        pub = _extract_published_from_entry(e)
-        dt_iso = pub["iso"]
-        dt_display = pub["display"]
-
-        if SKIP_RSS_IF_NO_PUBLISHED and not dt_iso:
-            continue
-
-        summary = strip_html(e.get("summary", "") or e.get("description", "") or "")
-        if summary and len(summary) > 420:
-            summary = summary[:419].rstrip() + "…"
-
-        rows.append({
-            "id": rid,
-            "date": dt_iso,
-            "date_display": dt_display,
-            "collected_at": collected_at,
-            "type": feed_cfg["type"],
-            "ministry_acronym": feed_cfg.get("acronym", "RSS"),
-            "ministry_name": feed_cfg["name"],
-            "title": strip_html(e.get("title", "")),
-            "excerpt": summary,
-            "url": e.get("link", ""),
-            "source": feed_cfg.get("source", "rss"),
-        })
-
-    log(f"RSS parsed: {feed_cfg['name']} usable_rows={len(rows)}")
-    return rows
-
-def fetch_releases_for_ministry(acronym: str, limit: int = 300) -> List[Dict[str, Any]]:
-    log(f"API fetch start: Ontario Newsroom acronym={acronym} limit={limit}")
-    r = session.get(API_URL, params={"language": LANG, "limit": limit, "sort": "desc"}, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    filtered = [x for x in data if (x.get("ministry_acronym") or "").strip() == acronym]
-    log(f"API fetched: acronym={acronym} total={len(data)} filtered={len(filtered)}")
-    return filtered
-
-# ============================================================
-# FEED POST
-# ============================================================
-
-def row_to_feed_item(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    rid = str(row.get("id") or "").strip()
-    title = str(row.get("title") or "").strip()
-    link = str(row.get("url") or "").strip()
-    source_name = str(row.get("ministry_name") or row.get("ministry_acronym") or row.get("source") or "Source").strip()
-
-    published = str(row.get("date") or "").strip()
-    collected = str(row.get("collected_at") or "").strip()
-
-    if not published:
-        return None
-
-    pub_z = _try_parse_any_date_string(published)
-    if not pub_z:
-        return None
-
-    ai_summary = str(row.get("ai_summary_1s") or row.get("excerpt") or "").strip()
-    ai_why = str(row.get("ai_why_lifelabs_cares") or "").strip()
-    ai_score = int(row.get("ai_score_0_100") or 0)
-    dollars = row.get("ai_dollar_values") or []
-    cities = row.get("ai_city_labels") or []
-    topics = row.get("ai_topics") or []
-
-    lines: List[str] = []
-    if ai_summary:
-        lines.append(ai_summary)
-    if ai_why:
-        lines.append(ai_why)
-    lines.append(f"Score: {ai_score}/100")
-    if dollars:
-        lines.append("Dollars: " + ", ".join([str(x) for x in dollars[:6]]))
-    if cities:
-        lines.append("Cities: " + ", ".join([str(x) for x in cities[:6]]))
-    if topics:
-        lines.append("Topics: " + ", ".join([str(x) for x in topics[:6]]))
-
-    content = "\n".join(lines)[:2000]
-
-    return {
-        "id": rid,
-        "title": title,
-        "content": content,
-        "link": link,
-        "pubDate": pub_z,
-        "publishedDate": pub_z,
-        "collectedAt": _try_parse_any_date_string(collected) or "",
-        "source": source_name,
-        "extra": {
-            "ai_summary_1s": row.get("ai_summary_1s"),
-            "ai_why_lifelabs_cares": row.get("ai_why_lifelabs_cares"),
-            "ai_score_0_100": row.get("ai_score_0_100"),
-            "ai_score_reason": row.get("ai_score_reason"),
-            "ai_topics": row.get("ai_topics"),
-            "ai_dollar_values": row.get("ai_dollar_values"),
-            "ai_city_labels": row.get("ai_city_labels"),
-            "ai_signals_found": row.get("ai_signals_found"),
-            "ai_entities": row.get("ai_entities"),
-            "ai_enriched_at": row.get("ai_enriched_at"),
-            "ai_model": row.get("ai_model"),
-        },
-    }
-
-def post_to_feed_function(items: List[Dict[str, Any]]) -> Optional[requests.Response]:
-    if not items:
-        return None
-
-    if DRY_RUN or (POST_ENABLED is False):
-        log(f"POST skipped. POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} items={len(items)}")
-        log("POST preview: " + json.dumps({"items": items}, ensure_ascii=False)[:900])
-        return None
-
-    if RAILWAY_API_KEY == "":
-        log("RAILWAY_API_KEY absent. POST skipped.")
-        return None
-
-    headers = {"x-api-key": RAILWAY_API_KEY, "Content-Type": "application/json"}
     payload = {"items": items}
-
-    r = session.post(FEED_POST_URL, headers=headers, json=payload, timeout=30)
-    log(f"Feed POST status: {r.status_code}")
-    log("Feed POST body preview: " + (r.text or "")[:900])
+    r = session.post(url, json=payload, timeout=60)
     r.raise_for_status()
-    return r
+    log(f"Posted {len(items)} items to {url}")
+
+# ============================================================
+# STORE + DEDUPE
+# ============================================================
+
+def index_store(store: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    for it in (store.get("items") or []):
+        if isinstance(it, dict) is False:
+            continue
+        _id = str(it.get("id") or "").strip()
+        if _id:
+            idx[_id] = it
+    return idx
+
+def ensure_store_shape(store: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(store, dict) is False:
+        store = {}
+    store.setdefault("items", [])
+    store.setdefault("meta", {})
+    store["meta"]["updated_at"] = utc_iso_z()
+    store["meta"]["feed_tag"] = FEED_TAG
+    return store
+
+def build_item_id(source: str, link: str, title: str) -> str:
+    return stable_id(source or "", link or "", title or "")
+
+def add_post_suffix(item_id: str) -> str:
+    if POST_ID_SUFFIX is False:
+        return item_id
+    return f"{item_id}_{FEED_TAG}"
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main() -> None:
-    log("Job start")
-    log(f"Config: POST_ENABLED={int(POST_ENABLED)} DRY_RUN={int(DRY_RUN)} ENRICH_ENABLED={int(ENRICH_ENABLED)} BATCH_SIZE={BATCH_SIZE}")
-    log(f"Local output: {os.path.abspath(OUT_JSON_LOCAL)}")
-    log(f"Remote store: enabled={int(STORE_REMOTE_ENABLED)} bucket={SUPABASE_BUCKET} path={SUPABASE_OBJECT_PATH}")
+    log("Start run.")
+    log("OpenAI key present: " + ("yes" if OPENAI_API_KEY else "no"))
 
     if RESET_STORE:
-        log("RESET_STORE=1")
-        if STORE_REMOTE_ENABLED:
-            # Overwrite with empty store
-            empty = {"items": []}
-            save_store_remote(empty)
-            log("Remote store reset complete.")
-        else:
-            if os.path.exists(OUT_JSON_LOCAL):
-                os.remove(OUT_JSON_LOCAL)
-                log("Local store file removed.")
+        store = {"items": [], "meta": {"reset_at": utc_iso_z()}}
+    else:
+        store = load_store_remote() if STORE_REMOTE_ENABLED else {"items": []}
+
+    store = ensure_store_shape(store)
+    existing = index_store(store)
 
     rules = load_score_rules()
-    log(f"Scoring rules loaded: boosts={len(rules.get('boosts', []))} penalties={len(rules.get('penalties', []))}")
 
-    store = load_store_remote() if STORE_REMOTE_ENABLED else {"items": []}
-    existing_items = store.get("items", [])
-    seen: Set[str] = {str(x.get("id")) for x in existing_items if x.get("id")}
-    log(f"Store loaded: existing_items={len(existing_items)} seen_ids={len(seen)}")
+    raw_items = collect_items()
+    log(f"Collected {len(raw_items)} raw items.")
 
-    new_rows: List[Dict[str, Any]] = []
+    new_or_update: List[Dict[str, Any]] = []
 
-    # A1) Ontario Newsroom API
-    acronyms = [parse_ministry_from_url(u) for u in FEED_URLS]
-    log(f"Sources: Ontario Newsroom API acronyms={acronyms}")
-    for acr in acronyms:
-        items = fetch_releases_for_ministry(acr)
-        added = 0
-        for it in items:
-            row = to_row(it)
-            rid = str(row.get("id") or "")
-            if rid == "" or rid in seen:
-                continue
-            seen.add(rid)
-            new_rows.append(row)
-            added += 1
-        log(f"API added: acronym={acr} added={added}")
+    for ri in raw_items:
+        source = str(ri.get("source") or "").strip()
+        title = str(ri.get("title") or "").strip()
+        link = str(ri.get("link") or "").strip()
+        published_raw = str(ri.get("published_raw") or "").strip()
+        published_dt = safe_parse_dt(published_raw)
+        published_iso = published_dt.isoformat().replace("+00:00", "Z") if published_dt else ""
 
-    # A2) Regulatory Registry RSS
-    log(f"Sources: Regulatory Registry feeds={len(REGISTRY_FEEDS)}")
-    for cfg in REGISTRY_FEEDS:
-        cfg2 = dict(cfg)
-        cfg2["acronym"] = "REG"
-        cfg2["source"] = "regulatory_registry_rss"
-        rss_items = parse_rss_feed(cfg2)
-        added = 0
-        for row in rss_items:
-            rid = str(row.get("id") or "")
-            if rid == "" or rid in seen:
-                continue
-            seen.add(rid)
-            new_rows.append(row)
-            added += 1
-        log(f"Reg feed added: {cfg['name']} added={added}")
+        base_id = build_item_id(source, link, title)
 
-    # A3) Extra RSS feeds
-    log(f"Sources: Extra RSS feeds={len(EXTRA_RSS_FEEDS)}")
-    for cfg in EXTRA_RSS_FEEDS:
-        cfg2 = dict(cfg)
-        cfg2["acronym"] = "RSS"
-        cfg2["source"] = "extra_rss"
-        rss_items = parse_rss_feed(cfg2)
-        added = 0
-        for row in rss_items:
-            rid = str(row.get("id") or "")
-            if rid == "" or rid in seen:
-                continue
-            seen.add(rid)
-            new_rows.append(row)
-            added += 1
-        log(f"Extra feed added: {cfg['name']} added={added}")
+        prev = existing.get(base_id)
+        if prev and REENRICH_ALL is False:
+            continue
 
-    total = len(new_rows)
-    log(f"Total new items to enrich: {total}")
-
-    if total == 0:
-        # Still write store back so timestamps update if needed
-        store_out = {
-            "source_urls": FEED_URLS,
-            "registry_feeds": [x["url"] for x in REGISTRY_FEEDS],
-            "extra_rss_feeds": [x["url"] for x in EXTRA_RSS_FEEDS],
-            "updated_at": utc_iso_z(),
-            "count": len(existing_items),
-            "items": existing_items,
-        }
-        save_store_local(store_out)
-        if STORE_REMOTE_ENABLED:
-            save_store_remote(store_out)
-            log("Remote store saved (no new items).")
-        log("Job done")
-        return
-
-    # Enrich in batches and checkpoint to Supabase Storage
-    enriched_all: List[Dict[str, Any]] = []
-    feed_all: List[Dict[str, Any]] = []
-
-    batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for b in range(batches):
-        start = b * BATCH_SIZE
-        end = min(start + BATCH_SIZE, total)
-        batch_rows = new_rows[start:end]
-        log(f"Enrich batch start: batch={b+1} range={start+1}-{end} of {total}")
-
-        for i in range(len(batch_rows)):
-            batch_rows[i] = enrich_row_with_openai(batch_rows[i], rules)
-            if (i + 1) % 5 == 0 or (i + 1) == len(batch_rows):
-                log(f"Enrich progress: batch={b+1} item={i+1}/{len(batch_rows)}")
-
-        # Append enriched
-        enriched_all.extend(batch_rows)
-
-        # Optional re-enrich existing
-        if REENRICH_ALL and existing_items:
-            log(f"REENRICH_ALL=1 start existing_items={len(existing_items)}")
-            for i in range(len(existing_items)):
-                existing_items[i] = enrich_row_with_openai(existing_items[i], rules)
-                if (i + 1) % 25 == 0 or (i + 1) == len(existing_items):
-                    log(f"REENRICH_ALL progress: item={i+1}/{len(existing_items)}")
-
-        # Store update
-        existing_items.extend(batch_rows)
-        existing_items.sort(key=lambda x: x.get("date") or "", reverse=True)
-
-        store_out = {
-            "source_urls": FEED_URLS,
-            "registry_feeds": [x["url"] for x in REGISTRY_FEEDS],
-            "extra_rss_feeds": [x["url"] for x in EXTRA_RSS_FEEDS],
-            "updated_at": utc_iso_z(),
-            "count": len(existing_items),
-            "items": existing_items,
+        item = {
+            "id": base_id,
+            "post_id": add_post_suffix(base_id),
+            "feed_tag": FEED_TAG,
+            "source": source,
+            "type": str(ri.get("type") or "").strip(),
+            "title": title,
+            "link": link,
+            "summary": str(ri.get("summary") or "").strip(),
+            "published": published_iso,
+            "published_raw": published_raw,
+            "ingested_at": utc_iso_z(),
         }
 
-        local_path = save_store_local(store_out)
-        log(f"Saved local store file: {local_path} items={len(existing_items)}")
+        text_for_score = (item["title"] + "\n" + item["summary"]).strip()
+        base_score = 10
+        if any(sig.lower() in text_for_score.lower() for sig in DOMAIN_SIGNALS):
+            base_score = 35
+        item["keyword_score"] = apply_keyword_score_rules(text_for_score, base_score, rules)
 
-        if STORE_REMOTE_ENABLED:
-            save_store_remote(store_out)
-            log(f"Saved remote store file: bucket={SUPABASE_BUCKET} path={SUPABASE_OBJECT_PATH} items={len(existing_items)}")
+        new_or_update.append(item)
 
-        # Post feed for this batch only
-        feed_items_raw = [row_to_feed_item(r) for r in batch_rows]
-        feed_items = [x for x in feed_items_raw if x is not None]
-        feed_all.extend(feed_items)
+    log(f"New or re-enrich items: {len(new_or_update)}")
 
-        log(f"Feed batch ready: batch={b+1} feed_items={len(feed_items)}")
-        post_to_feed_function(feed_items)
+    client = get_openai_client()
+    enriched: List[Dict[str, Any]] = []
 
-        log(f"Enrich batch done: batch={b+1} saved_and_posted={len(batch_rows)}")
+    if client is None:
+        enriched = new_or_update
+    else:
+        for i, it in enumerate(new_or_update):
+            if (i + 1) % 10 == 0:
+                log(f"Enrich progress {i+1}/{len(new_or_update)}")
+            enriched.append(enrich_one(client, it))
 
-    log(f"Run summary: new_enriched={len(enriched_all)} posted_items={len(feed_all)} local_store={os.path.abspath(OUT_JSON_LOCAL)}")
-    log("Job done")
+    # Update store
+    by_id = index_store(store)
+    for it in enriched:
+        by_id[it["id"]] = it
+
+    # Keep newest first by published, then ingested
+    def _sort_key(x: Dict[str, Any]) -> str:
+        p = str(x.get("published") or "")
+        i = str(x.get("ingested_at") or "")
+        return (p or "") + "|" + (i or "")
+
+    all_items = list(by_id.values())
+    all_items.sort(key=_sort_key, reverse=True)
+
+    store["items"] = all_items
+    store["meta"]["count"] = len(all_items)
+
+    local_path = save_store_local(store)
+    log(f"Saved local store: {local_path}")
+
+    if STORE_REMOTE_ENABLED:
+        save_store_remote(store)
+        log("Saved remote store.")
+
+    # Post only the enriched batch, not the full store
+    if POST_TO_MAIN_FEED:
+        post_items(FEED_POST_URL, enriched)
+    if POST_TO_AI_FEED:
+        post_items(FEED_POST_URL_AI, enriched)
+
+    log("Done.")
 
 if __name__ == "__main__":
     main()
