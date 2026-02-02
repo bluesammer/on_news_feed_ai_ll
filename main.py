@@ -69,7 +69,11 @@ EXTRA_RSS_FEEDS = [
     {"name": "Born Ontario News", "type": "Born Ontario", "url": "https://www.bornontario.ca/news/rss/"},
     {"name": "IPC PHIPA Decisions", "type": "PHIPA Decisions", "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do"},
     {"name": "Ontario Health News (FetchRSS)", "type": "Ontario Health News", "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss"},
+
+    {"name": "Google Alerts Ontario Health Internet", "type": "Google Alert", "url": "https://www.google.ca/alerts/feeds/03113921822178662323/151430372448241348"},
+    {"name": "Google Alerts LifeLabs Internet", "type": "Google Alert", "url": "https://www.google.com/alerts/feeds/03113921822178662323/8381571961042850572"},
 ]
+
 
 FEED_TAG = (os.getenv("FEED_TAG", "ai") or "ai").strip()
 
