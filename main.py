@@ -25,12 +25,6 @@
 # main.py
 # RSS + Ontario News API -> store (Supabase Storage) -> enrich N per run -> post full store to Supabase Edge Function
 # Built for Railway logs. DEBUG=1 prints step-by-step.
-#
-# Change in this version:
-# - Removes ONTARIO_CITIES list.
-# - ChatGPT returns a single Ontario city name in "city".
-# - If text mentions a region/county/district, ChatGPT converts it to the main city (largest/admin centre).
-# - Code stores ai_city and preserves it across runs.
 
 import os
 import sys
@@ -54,12 +48,9 @@ from openai import OpenAI
 
 API_URL = "https://api.news.ontario.ca/api/v1/releases"
 
-FEED_URLS = [
-    "https://news.ontario.ca/moh/en",
-    "https://news.ontario.ca/mltc/en",
-]
-
-PATH_TO_ACRONYM = {"moh": "MOH", "mltc": "MLTC"}
+# Ontario newsroom pages are web pages, feedparser reads them as zero items.
+# Pull MOH / MLTC via Ontario News API instead.
+FEED_URLS: List[str] = []
 
 REGISTRY_FEEDS = [
     {
@@ -86,6 +77,11 @@ MAX_STORE_ITEMS = int((os.getenv("MAX_STORE_ITEMS", "160") or "160").strip())
 MAX_ENRICH_ITEMS = int((os.getenv("MAX_ENRICH_ITEMS", "5") or "5").strip())
 MAX_AGE_DAYS = int((os.getenv("MAX_AGE_DAYS", "365") or "365").strip())
 
+# Ontario News API paging controls
+MAX_API_ITEMS = int((os.getenv("MAX_API_ITEMS", "5000") or "5000").strip())
+MAX_API_PAGES = int((os.getenv("MAX_API_PAGES", "20") or "20").strip())
+API_PAGE_SIZE = int((os.getenv("API_PAGE_SIZE", "200") or "200").strip())
+
 ENRICH_ENABLED = (os.getenv("ENRICH_ENABLED", "1") or "1").strip() == "1"
 ENRICH_MODEL = (os.getenv("ENRICH_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
@@ -98,7 +94,7 @@ FEED_FUNCTION_KEY = (os.getenv("FEED_FUNCTION_KEY", "") or "").strip()
 POST_ENABLED = (os.getenv("POST_ENABLED", "0") or "0").strip() == "1"
 DRY_RUN = (os.getenv("DRY_RUN", "0") or "0").strip() == "1"
 
-# Supabase Storage persistence (recommended)
+# Supabase Storage persistence
 SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 SUPABASE_BUCKET = (os.getenv("SUPABASE_BUCKET", "") or "").strip()
@@ -115,7 +111,7 @@ RESET_STORE = (os.getenv("RESET_STORE", "0") or "0").strip() == "1"
 DEBUG = (os.getenv("DEBUG", "0") or "0").strip() == "1"
 DEBUG_SAMPLE_PER_SOURCE = int((os.getenv("DEBUG_SAMPLE_PER_SOURCE", "0") or "0").strip())
 
-SKIP_RSS_IF_NO_PUBLISHED = True
+SKIP_RSS_IF_NO_PUBLISHED = (os.getenv("SKIP_RSS_IF_NO_PUBLISHED", "1") or "1").strip() == "1"
 
 TOPICS = [
     "Billing and Funding Changes",
@@ -133,12 +129,6 @@ TOPICS = [
 ]
 ALLOWED_TOPICS = set(TOPICS)
 
-# City rules:
-# - Return a single Ontario city name in "city".
-# - If text mentions a region/county/district/municipality, convert to its main city
-#   (largest city or admin centre). Example: "Durham Region" -> "Oshawa".
-# - If multiple cities appear, return the most relevant, else the largest.
-# - If no Ontario city fits, return "".
 ENRICH_SYSTEM = (
     "Return ONLY valid JSON. No markdown. No code fences. No extra text.\n"
     "Keys: summary, topic, score, keywords, city.\n"
@@ -250,11 +240,6 @@ def extract_json_object(text: str) -> str:
     return ""
 
 def heuristic_city_hint(text: str) -> str:
-    """
-    Cheap hint for the model.
-    Finds "City of X", "Town of X", "Region of X", "County of X", etc.
-    Returns a short hint string.
-    """
     s = text or ""
     pats = [
         r"(?i)\bcity of\s+([a-z][a-z\s\.\-]{2,60})\b",
@@ -273,7 +258,7 @@ def heuristic_city_hint(text: str) -> str:
             x2 = " ".join(str(x).strip().split())
             if x2:
                 hits.append(x2)
-    if not hits:
+    if len(hits) == 0:
         return ""
     return "Location mentions: " + "; ".join(hits[:5])
 
@@ -285,13 +270,17 @@ def heuristic_city_hint(text: str) -> str:
 def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     page = 1
-    limit = 500  # big page size
 
     while True:
+        if page > MAX_API_PAGES:
+            break
+        if len(out) >= MAX_API_ITEMS:
+            break
+
         try:
             params = {
                 "language": "en",
-                "limit": limit,
+                "limit": min(API_PAGE_SIZE, 500),
                 "page": page,
                 "sort": "desc",
             }
@@ -330,18 +319,16 @@ def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
                     }
                 )
 
-            page += 1
+                if len(out) >= MAX_API_ITEMS:
+                    break
 
-            # hard stop to avoid runaway
-            if len(out) >= MAX_STORE_ITEMS:
-                break
+            page += 1
 
         except Exception as e:
             log(f"Ontario API fetch error page={page}: {e}")
             break
 
     return out
-
 
 def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -382,10 +369,8 @@ def collect_items() -> List[Dict[str, Any]]:
     items.extend(a)
 
     for u in FEED_URLS:
-        token = u.rstrip("/").split("/")[-2] if "/" in u.rstrip("/") else u
-        src = PATH_TO_ACRONYM.get(token, token.upper())
-        x = fetch_rss(u, src, "Ontario RSS")
-        dbg(f"STEP fetch.rss src={src} items={len(x)}")
+        x = fetch_rss(u, "Ontario RSS", "Ontario RSS")
+        dbg(f"STEP fetch.rss url={u} items={len(x)}")
         items.extend(x)
 
     for f in REGISTRY_FEEDS:
@@ -403,7 +388,7 @@ def collect_items() -> List[Dict[str, Any]]:
 
 
 # =========================
-# SUPABASE STORAGE (PERSISTENCE)
+# SUPABASE STORAGE
 # =========================
 
 def supabase_object_url() -> str:
@@ -504,7 +489,7 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
             {"role": "system", "content": ENRICH_SYSTEM},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
+        temperature=0.0,
     )
 
     raw = (resp.choices[0].message.content or "").strip()
@@ -543,9 +528,7 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
         kws = []
     ai_keywords = [str(x).strip() for x in kws][:3]
 
-    # Single city string
     ai_city = str(data.get("city") or "").strip()
-    # Light cleanup
     ai_city = re.sub(r"\s+", " ", ai_city).strip()
     if len(ai_city) > 80:
         ai_city = ai_city[:80].strip()
@@ -580,19 +563,16 @@ def post_full_store(items: List[Dict[str, Any]]) -> None:
         return
 
     dbg(f"STEP post.start url={FEED_POST_URL} items={len(items)}")
-    r = session.post(FEED_POST_URL, json={"items": items}, headers=feed_headers(), timeout=60)
+    r = session.post(FEED_POST_URL, json={"items": items}, headers=feed_headers(), timeout=120)
     dbg(f"STEP post.status code={r.status_code}")
-
     if r.status_code == 401:
         log("POST 401. Check FEED_FUNCTION_KEY.")
         log((r.text or "")[:300])
         return
-
     if r.status_code == 404:
         log("POST 404. Check FEED_POST_URL.")
         log((r.text or "")[:300])
         return
-
     r.raise_for_status()
     dbg("STEP post.ok=1")
 
@@ -639,6 +619,7 @@ def main() -> None:
     log("RUN start")
     log(f"DEBUG={1 if DEBUG else 0} DRY_RUN={1 if DRY_RUN else 0} POST_ENABLED={1 if POST_ENABLED else 0}")
     log(f"MAX_STORE_ITEMS={MAX_STORE_ITEMS} MAX_ENRICH_ITEMS={MAX_ENRICH_ITEMS} MAX_AGE_DAYS={MAX_AGE_DAYS}")
+    log(f"MAX_API_ITEMS={MAX_API_ITEMS} MAX_API_PAGES={MAX_API_PAGES} API_PAGE_SIZE={API_PAGE_SIZE}")
     log("STORE_REMOTE_ENABLED=" + ("1" if STORE_REMOTE_ENABLED else "0"))
 
     if RESET_STORE:
@@ -722,12 +703,20 @@ def main() -> None:
 
     client = get_openai_client()
 
+    ok_ct = 0
+    err_ct = 0
+
     if client is None:
         dbg("STEP enrich.skip reason=ENRICH_ENABLED=0")
     else:
         for i, it in enumerate(batch, start=1):
             dbg(f"STEP enrich.item {i}/{len(batch)} src={it.get('source')} title={str(it.get('title') or '')[:70]}")
             updated = enrich_one(client, it)
+            if str(updated.get("ai_error") or "").strip() == "":
+                ok_ct += 1
+            else:
+                err_ct += 1
+            dbg(f"STEP enrich.result {i}/{len(batch)} ok={1 if str(updated.get('ai_error') or '').strip()=='' else 0}")
             existing_idx[updated["id"]] = updated
 
     all_items = list(existing_idx.values())
@@ -743,6 +732,8 @@ def main() -> None:
         "store_items": len(all_items),
         "unenriched_remaining": len([x for x in all_items if str(x.get("ai_summary") or "").strip() == ""]),
         "enriched_this_run": len(batch) if ENRICH_ENABLED else 0,
+        "enrich_ok": ok_ct,
+        "enrich_err": err_ct,
     }
     store["items"] = all_items
 
@@ -755,9 +746,10 @@ def main() -> None:
     else:
         dbg("STEP store.remote_skip reason=STORE_REMOTE_ENABLED=0")
 
+    dbg(f"STEP post.plan items={len(all_items)}")
     post_full_store(all_items)
 
-    log("RUN done")
+    log(f"RUN done store_items={len(all_items)} enrich_ok={ok_ct} enrich_err={err_ct}")
 
 if __name__ == "__main__":
     main()
