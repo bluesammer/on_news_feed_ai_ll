@@ -27,9 +27,9 @@
 # Goals:
 # 1) Same file works locally or on Railway
 # 2) OpenAI key: hardcoded fallback OR Railway env
-# 3) Posting: includes auth headers to avoid 401
+# 3) Posting: uses x-api-key header to avoid 401
 # 4) Token control: limit how many items get enriched per run
-# 5) Dedupe: persists store in Supabase Storage so old items do not re-enrich
+# 5) Dedupe: persist store in Supabase Storage so old items do not re-enrich
 
 import os
 import sys
@@ -136,8 +136,8 @@ FEED_POST_URL_AI = os.getenv("FEED_POST_URL_AI", _default_ai_feed_url(FEED_POST_
 
 POST_ID_SUFFIX = os.getenv("POST_ID_SUFFIX", "1").strip() == "1"
 
-# If your Edge Function requires a key, set this in Railway.
-# Use anon key or service role key, depends on your function settings.
+# Your Edge Function auth key.
+# Your feed endpoint expects this in the x-api-key header.
 FEED_FUNCTION_KEY = os.getenv("FEED_FUNCTION_KEY", "").strip()
 
 SKIP_RSS_IF_NO_PUBLISHED = True
@@ -162,7 +162,9 @@ SUPABASE_OBJECT_PATH = os.getenv(
     f"feeds/combined_feed_{FEED_TAG}.json",
 ).strip()
 
-STORE_REMOTE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET and SUPABASE_OBJECT_PATH)
+STORE_REMOTE_ENABLED = bool(
+    SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET and SUPABASE_OBJECT_PATH
+)
 
 # ============================================================
 # ENRICHMENT CONFIG
@@ -231,7 +233,9 @@ PLACE_MAP = {
     "leaside": "Toronto",
 }
 
-MONEY_RE = re.compile(r"(?i)\$[\s]*([\d]{1,3}(?:,[\d]{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
+MONEY_RE = re.compile(
+    r"(?i)\$[\s]*([\d]{1,3}(?:,[\d]{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)"
+)
 
 ENRICH_SYSTEM = (
     "You label Ontario health policy updates for lab services and related business impact.\n"
@@ -484,7 +488,6 @@ def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, An
 
 def collect_items() -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-
     items.extend(fetch_ontario_news_pages())
 
     for u in FEED_URLS:
@@ -568,13 +571,10 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 def _feed_headers() -> Dict[str, str]:
-    if FEED_FUNCTION_KEY == "":
-        return {"Content-Type": "application/json"}
-    return {
-        "Authorization": f"Bearer {FEED_FUNCTION_KEY}",
-        "apikey": FEED_FUNCTION_KEY,
-        "Content-Type": "application/json",
-    }
+    h: Dict[str, str] = {"Content-Type": "application/json"}
+    if FEED_FUNCTION_KEY != "":
+        h["x-api-key"] = FEED_FUNCTION_KEY
+    return h
 
 def post_items(url: str, items: List[Dict[str, Any]]) -> None:
     if POST_ENABLED is False:
