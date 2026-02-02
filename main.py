@@ -23,8 +23,13 @@
 
 
 # main.py
-# News feed + OpenAI enrichment + keyword scoring rules
-# Stores combined_feed_<tag>.json in Supabase Storage so cron runs resume correctly
+# RSS + Ontario News API -> OpenAI enrichment -> optional store (Supabase Storage) -> post to Supabase Edge Function
+# Goals:
+# 1) Same file works locally or on Railway
+# 2) OpenAI key: hardcoded fallback OR Railway env
+# 3) Posting: includes auth headers to avoid 401
+# 4) Token control: limit how many items get enriched per run
+# 5) Dedupe: persists store in Supabase Storage so old items do not re-enrich
 
 import os
 import sys
@@ -44,13 +49,12 @@ from openai import OpenAI
 # ============================================================
 # OPENAI KEY SOURCE
 # ============================================================
-# Option A: Hard code here for local runs. Leave "" on Railway.
-# Option B: Set OPENAI_API_KEY in Railway Variables.
-HARDCODED_OPENAI_KEY = ""  # paste sk-proj-... here, or leave blank
+# Local testing: paste your key here and do NOT commit to git.
+# Railway: leave blank and set OPENAI_API_KEY in Railway Variables.
+HARDCODED_OPENAI_KEY = ""  # sk-proj-...
 
 _env_key = os.getenv("OPENAI_API_KEY", "").strip()
 _hard_key = (HARDCODED_OPENAI_KEY or "").strip()
-
 if _env_key == "" and _hard_key != "":
     os.environ["OPENAI_API_KEY"] = _hard_key
 
@@ -59,7 +63,6 @@ if _env_key == "" and _hard_key != "":
 # ============================================================
 
 API_URL = "https://api.news.ontario.ca/api/v1/releases"
-LANG = "en"
 
 FEED_URLS = [
     "https://news.ontario.ca/moh/en",
@@ -102,13 +105,26 @@ EXTRA_RSS_FEEDS = [
     },
 ]
 
+# Tag controls:
+# - local store file name
+# - remote object path default
+# - post_id suffix to avoid collisions
 FEED_TAG = os.getenv("FEED_TAG", "ai").strip()
+
 OUT_JSON_LOCAL = os.getenv("OUT_JSON_LOCAL", f"combined_feed_{FEED_TAG}.json").strip()
 
+# Posting (Lovable reads from your Edge Function output)
 FEED_POST_URL = os.getenv(
     "FEED_POST_URL",
     "https://tcgdugdhwtbyeygdqdob.supabase.co/functions/v1/feed",
 ).strip()
+
+POST_ENABLED = os.getenv("POST_ENABLED", "0").strip() == "1"
+DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
+
+# Use ONLY /feed for now unless you have created /feed_ai in Supabase
+POST_TO_MAIN_FEED = os.getenv("POST_TO_MAIN_FEED", "1").strip() == "1"
+POST_TO_AI_FEED = os.getenv("POST_TO_AI_FEED", "0").strip() == "1"
 
 def _default_ai_feed_url(base: str) -> str:
     b = (base or "").strip()
@@ -118,22 +134,23 @@ def _default_ai_feed_url(base: str) -> str:
 
 FEED_POST_URL_AI = os.getenv("FEED_POST_URL_AI", _default_ai_feed_url(FEED_POST_URL)).strip()
 
-POST_TO_MAIN_FEED = os.getenv("POST_TO_MAIN_FEED", "0").strip() == "1"
-POST_TO_AI_FEED = os.getenv("POST_TO_AI_FEED", "1").strip() == "1"
 POST_ID_SUFFIX = os.getenv("POST_ID_SUFFIX", "1").strip() == "1"
 
-POST_ENABLED = os.getenv("POST_ENABLED", "0").strip() == "1"
-DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
+# If your Edge Function requires a key, set this in Railway.
+# Use anon key or service role key, depends on your function settings.
+FEED_FUNCTION_KEY = os.getenv("FEED_FUNCTION_KEY", "").strip()
 
 SKIP_RSS_IF_NO_PUBLISHED = True
 
 RESET_STORE = os.getenv("RESET_STORE", "0").strip() == "1"
 REENRICH_ALL = os.getenv("REENRICH_ALL", "0").strip() == "1"
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50").strip())
+# Limit how many items hit OpenAI per run
+# 0 means all
+MAX_ENRICH_ITEMS = int(os.getenv("MAX_ENRICH_ITEMS", "5").strip())
 
 # ============================================================
-# SUPABASE STORAGE STORE
+# SUPABASE STORAGE STORE (optional but recommended)
 # ============================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
@@ -284,7 +301,13 @@ def get_openai_client() -> Optional[OpenAI]:
 def supabase_object_url() -> str:
     return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{SUPABASE_OBJECT_PATH}"
 
-def supabase_headers_json() -> Dict[str, str]:
+def supabase_headers_read() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+def supabase_headers_write() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -297,13 +320,8 @@ def load_store_remote() -> Dict[str, Any]:
         return {"items": []}
 
     url = supabase_object_url()
-    h = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    }
-
     try:
-        r = session.get(url, headers=h, timeout=30)
+        r = session.get(url, headers=supabase_headers_read(), timeout=30)
         if r.status_code == 404:
             log("Remote store missing. Starting fresh.")
             return {"items": []}
@@ -321,9 +339,8 @@ def save_store_remote(store: Dict[str, Any]) -> None:
     if STORE_REMOTE_ENABLED is False:
         return
     url = supabase_object_url()
-    h = supabase_headers_json()
     payload = json.dumps(store, ensure_ascii=False).encode("utf-8")
-    r = session.put(url, headers=h, data=payload, timeout=30)
+    r = session.put(url, headers=supabase_headers_write(), data=payload, timeout=30)
     r.raise_for_status()
 
 def save_store_local(store: Dict[str, Any]) -> str:
@@ -408,12 +425,14 @@ def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
         r = session.get(API_URL, timeout=30)
         r.raise_for_status()
         data = r.json()
+
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             items = data["items"]
         elif isinstance(data, list):
             items = data
         else:
             items = []
+
         for it in items:
             if isinstance(it, dict) is False:
                 continue
@@ -469,7 +488,6 @@ def collect_items() -> List[Dict[str, Any]]:
     items.extend(fetch_ontario_news_pages())
 
     for u in FEED_URLS:
-        # For these, source name comes from URL path token
         token = u.rstrip("/").split("/")[-2] if "/" in u.rstrip("/") else u
         src = PATH_TO_ACRONYM.get(token, token.upper())
         items.extend(fetch_rss(u, src, "Ontario RSS"))
@@ -549,6 +567,15 @@ def enrich_one(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
 # POSTING
 # ============================================================
 
+def _feed_headers() -> Dict[str, str]:
+    if FEED_FUNCTION_KEY == "":
+        return {"Content-Type": "application/json"}
+    return {
+        "Authorization": f"Bearer {FEED_FUNCTION_KEY}",
+        "apikey": FEED_FUNCTION_KEY,
+        "Content-Type": "application/json",
+    }
+
 def post_items(url: str, items: List[Dict[str, Any]]) -> None:
     if POST_ENABLED is False:
         log("POST disabled.")
@@ -557,10 +584,23 @@ def post_items(url: str, items: List[Dict[str, Any]]) -> None:
         log(f"DRY_RUN on. Skip post to {url}. Items={len(items)}")
         return
 
-    payload = {"items": items}
-    r = session.post(url, json=payload, timeout=60)
-    r.raise_for_status()
-    log(f"Posted {len(items)} items to {url}")
+    try:
+        payload = {"items": items}
+        r = session.post(url, json=payload, headers=_feed_headers(), timeout=60)
+
+        if r.status_code == 401:
+            log("Post failed 401. Check FEED_FUNCTION_KEY.")
+            log((r.text or "")[:300])
+            return
+
+        if r.status_code == 404:
+            log(f"Post failed 404. Endpoint missing: {url}")
+            return
+
+        r.raise_for_status()
+        log(f"Posted {len(items)} items to {url}")
+    except Exception as e:
+        log(f"Post error to {url}: {e}")
 
 # ============================================================
 # STORE + DEDUPE
@@ -585,9 +625,6 @@ def ensure_store_shape(store: Dict[str, Any]) -> Dict[str, Any]:
     store["meta"]["feed_tag"] = FEED_TAG
     return store
 
-def build_item_id(source: str, link: str, title: str) -> str:
-    return stable_id(source or "", link or "", title or "")
-
 def add_post_suffix(item_id: str) -> str:
     if POST_ID_SUFFIX is False:
         return item_id
@@ -600,6 +637,12 @@ def add_post_suffix(item_id: str) -> str:
 def main() -> None:
     log("Start run.")
     log("OpenAI key present: " + ("yes" if OPENAI_API_KEY else "no"))
+    log("Remote store enabled: " + ("yes" if STORE_REMOTE_ENABLED else "no"))
+    log("Post enabled: " + ("yes" if POST_ENABLED else "no"))
+    log("Post to main: " + ("yes" if POST_TO_MAIN_FEED else "no"))
+    log("Post to ai: " + ("yes" if POST_TO_AI_FEED else "no"))
+    if MAX_ENRICH_ITEMS > 0:
+        log(f"Max enrich items: {MAX_ENRICH_ITEMS}")
 
     if RESET_STORE:
         store = {"items": [], "meta": {"reset_at": utc_iso_z()}}
@@ -624,7 +667,7 @@ def main() -> None:
         published_dt = safe_parse_dt(published_raw)
         published_iso = published_dt.isoformat().replace("+00:00", "Z") if published_dt else ""
 
-        base_id = build_item_id(source, link, title)
+        base_id = stable_id(source, link, title)
 
         prev = existing.get(base_id)
         if prev and REENRICH_ALL is False:
@@ -654,6 +697,10 @@ def main() -> None:
 
     log(f"New or re-enrich items: {len(new_or_update)}")
 
+    if MAX_ENRICH_ITEMS > 0 and len(new_or_update) > MAX_ENRICH_ITEMS:
+        new_or_update = new_or_update[:MAX_ENRICH_ITEMS]
+        log(f"Limited enrich batch to {len(new_or_update)} items.")
+
     client = get_openai_client()
     enriched: List[Dict[str, Any]] = []
 
@@ -670,7 +717,6 @@ def main() -> None:
     for it in enriched:
         by_id[it["id"]] = it
 
-    # Keep newest first by published, then ingested
     def _sort_key(x: Dict[str, Any]) -> str:
         p = str(x.get("published") or "")
         i = str(x.get("ingested_at") or "")
@@ -689,7 +735,7 @@ def main() -> None:
         save_store_remote(store)
         log("Saved remote store.")
 
-    # Post only the enriched batch, not the full store
+    # Post only the enriched batch
     if POST_TO_MAIN_FEED:
         post_items(FEED_POST_URL, enriched)
     if POST_TO_AI_FEED:
