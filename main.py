@@ -284,40 +284,64 @@ def heuristic_city_hint(text: str) -> str:
 
 def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    try:
-        r = session.get(API_URL, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+    page = 1
+    limit = 500  # big page size
 
-        if isinstance(data, dict) and isinstance(data.get("items"), list):
-            items = data["items"]
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = []
+    while True:
+        try:
+            params = {
+                "language": "en",
+                "limit": limit,
+                "page": page,
+                "sort": "desc",
+            }
+            r = session.get(API_URL, params=params, timeout=30)
+            r.raise_for_status()
 
-        for it in items:
-            if isinstance(it, dict) is False:
-                continue
-            title = str(it.get("title") or "").strip()
-            url = str(it.get("url") or it.get("link") or "").strip()
-            published = str(it.get("published") or it.get("pubDate") or it.get("date") or "").strip()
-            summary = str(it.get("summary") or it.get("description") or "").strip()
-            if title == "" and url == "":
-                continue
-            out.append(
-                {
-                    "source": "Ontario News API",
-                    "type": "Ontario Release",
-                    "title": title,
-                    "link": url,
-                    "published_raw": published,
-                    "summary": summary,
-                }
-            )
-    except Exception as e:
-        log(f"Ontario API fetch error: {e}")
+            data = r.json()
+            items = data["items"] if isinstance(data, dict) and isinstance(data.get("items"), list) else []
+            if len(items) == 0:
+                break
+
+            for it in items:
+                title = str(it.get("title") or it.get("clean_title") or "").strip()
+                url = str(it.get("url") or it.get("link") or "").strip()
+                published = str(it.get("release_date_time_formatted") or it.get("published") or "").strip()
+                summary = str(it.get("content_lead") or it.get("summary") or it.get("description") or "").strip()
+
+                lead = it.get("lead_ministry") or {}
+                ministry_acronym = str(lead.get("acronym") or it.get("ministry_acronym") or "").strip()
+                ministry_name = str(lead.get("name_abbreviated") or it.get("ministry_abbreviated") or "").strip()
+
+                src = ministry_acronym if ministry_acronym else "Ontario News API"
+                typ = "Ontario Release" if ministry_name == "" else f"Ontario Release | {ministry_name}"
+
+                if title == "" and url == "":
+                    continue
+
+                out.append(
+                    {
+                        "source": src,
+                        "type": typ,
+                        "title": title,
+                        "link": url,
+                        "published_raw": published,
+                        "summary": summary,
+                    }
+                )
+
+            page += 1
+
+            # hard stop to avoid runaway
+            if len(out) >= MAX_STORE_ITEMS:
+                break
+
+        except Exception as e:
+            log(f"Ontario API fetch error page={page}: {e}")
+            break
+
     return out
+
 
 def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
