@@ -23,7 +23,7 @@
 
 
 # main.py
-# RSS + Ontario News API -> store (Supabase Storage) -> enrich N per run -> post full store to Supabase Edge Function
+# RSS + screen-scrape -> store (Supabase Storage) -> enrich N per run -> post full store to Supabase Edge Function
 # Built for Railway logs. DEBUG=1 prints step-by-step.
 
 import os
@@ -34,6 +34,7 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin, urlparse
 
 import requests
 import feedparser
@@ -46,12 +47,17 @@ from openai import OpenAI
 # CONFIG
 # =========================
 
-API_URL = "https://api.news.ontario.ca/api/v1/releases"
+# Screen scrape sources
+FEED_URLS = [
+    "https://news.ontario.ca/moh/en",
+    "https://news.ontario.ca/mltc/en",
+    "https://www.ontariohealth.ca/news",
+    "https://www.publichealthontario.ca/en/Education-and-Events/Events",
+]
 
-# Ontario newsroom pages are web pages, feedparser reads them as zero items.
-# Pull MOH / MLTC via Ontario News API instead.
-FEED_URLS: List[str] = []
+PATH_TO_ACRONYM = {"moh": "MOH", "mltc": "MLTC"}
 
+# RSS sources
 REGISTRY_FEEDS = [
     {
         "name": "Regulatory Registry News",
@@ -69,22 +75,15 @@ EXTRA_RSS_FEEDS = [
     {"name": "Born Ontario News", "type": "Born Ontario", "url": "https://www.bornontario.ca/news/rss/"},
     {"name": "IPC PHIPA Decisions", "type": "PHIPA Decisions", "url": "https://decisia.lexum.com/ipc-cipvp/phipa/en/rss.do"},
     {"name": "Ontario Health News (FetchRSS)", "type": "Ontario Health News", "url": "https://fetchrss.com/feed/1vjLZQBVP4Fm1vjLZ13Iw36I.rss"},
-
     {"name": "Google Alerts Ontario Health Internet", "type": "Google Alert", "url": "https://www.google.ca/alerts/feeds/03113921822178662323/151430372448241348"},
     {"name": "Google Alerts LifeLabs Internet", "type": "Google Alert", "url": "https://www.google.com/alerts/feeds/03113921822178662323/8381571961042850572"},
 ]
-
 
 FEED_TAG = (os.getenv("FEED_TAG", "ai") or "ai").strip()
 
 MAX_STORE_ITEMS = int((os.getenv("MAX_STORE_ITEMS", "160") or "160").strip())
 MAX_ENRICH_ITEMS = int((os.getenv("MAX_ENRICH_ITEMS", "5") or "5").strip())
 MAX_AGE_DAYS = int((os.getenv("MAX_AGE_DAYS", "365") or "365").strip())
-
-# Ontario News API paging controls
-MAX_API_ITEMS = int((os.getenv("MAX_API_ITEMS", "5000") or "5000").strip())
-MAX_API_PAGES = int((os.getenv("MAX_API_PAGES", "20") or "20").strip())
-API_PAGE_SIZE = int((os.getenv("API_PAGE_SIZE", "200") or "200").strip())
 
 ENRICH_ENABLED = (os.getenv("ENRICH_ENABLED", "1") or "1").strip() == "1"
 ENRICH_MODEL = (os.getenv("ENRICH_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
@@ -116,6 +115,9 @@ DEBUG = (os.getenv("DEBUG", "0") or "0").strip() == "1"
 DEBUG_SAMPLE_PER_SOURCE = int((os.getenv("DEBUG_SAMPLE_PER_SOURCE", "0") or "0").strip())
 
 SKIP_RSS_IF_NO_PUBLISHED = (os.getenv("SKIP_RSS_IF_NO_PUBLISHED", "1") or "1").strip() == "1"
+
+SCREEN_SCRAPE_MAX_LINKS_PER_PAGE = int((os.getenv("SCREEN_SCRAPE_MAX_LINKS_PER_PAGE", "30") or "30").strip())
+SCREEN_SCRAPE_TIMEOUT_SEC = int((os.getenv("SCREEN_SCRAPE_TIMEOUT_SEC", "30") or "30").strip())
 
 TOPICS = [
     "Billing and Funding Changes",
@@ -182,6 +184,12 @@ def build_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (compatible; FeedCollector/1.0; +https://example.invalid)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
     return s
 
 session = build_session()
@@ -266,73 +274,44 @@ def heuristic_city_hint(text: str) -> str:
         return ""
     return "Location mentions: " + "; ".join(hits[:5])
 
+def host_of(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def infer_source_from_url(url: str) -> str:
+    u = (url or "").strip()
+    if u == "":
+        return "Screen Scrape"
+    h = host_of(u)
+    if "news.ontario.ca" in h:
+        path = urlparse(u).path.strip("/").split("/")
+        if len(path) >= 1:
+            k = path[0].lower()
+            if k in PATH_TO_ACRONYM:
+                return PATH_TO_ACRONYM[k]
+        return "Ontario Newsroom"
+    if "ontariohealth.ca" in h:
+        return "Ontario Health"
+    if "publichealthontario.ca" in h:
+        return "Public Health Ontario"
+    return h if h else "Screen Scrape"
+
+def infer_type_from_url(url: str) -> str:
+    u = (url or "").lower()
+    if "news.ontario.ca" in u:
+        return "Ontario Newsroom"
+    if "ontariohealth.ca/news" in u:
+        return "Ontario Health News"
+    if "/education-and-events/events" in u:
+        return "PHO Events"
+    return "Screen Scrape"
+
 
 # =========================
 # FETCH
 # =========================
-
-def fetch_ontario_news_pages() -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    page = 1
-
-    while True:
-        if page > MAX_API_PAGES:
-            break
-        if len(out) >= MAX_API_ITEMS:
-            break
-
-        try:
-            params = {
-                "language": "en",
-                "limit": min(API_PAGE_SIZE, 500),
-                "page": page,
-                "sort": "desc",
-            }
-            r = session.get(API_URL, params=params, timeout=30)
-            r.raise_for_status()
-
-            data = r.json()
-            items = data["items"] if isinstance(data, dict) and isinstance(data.get("items"), list) else []
-            if len(items) == 0:
-                break
-
-            for it in items:
-                title = str(it.get("title") or it.get("clean_title") or "").strip()
-                url = str(it.get("url") or it.get("link") or "").strip()
-                published = str(it.get("release_date_time_formatted") or it.get("published") or "").strip()
-                summary = str(it.get("content_lead") or it.get("summary") or it.get("description") or "").strip()
-
-                lead = it.get("lead_ministry") or {}
-                ministry_acronym = str(lead.get("acronym") or it.get("ministry_acronym") or "").strip()
-                ministry_name = str(lead.get("name_abbreviated") or it.get("ministry_abbreviated") or "").strip()
-
-                src = ministry_acronym if ministry_acronym else "Ontario News API"
-                typ = "Ontario Release" if ministry_name == "" else f"Ontario Release | {ministry_name}"
-
-                if title == "" and url == "":
-                    continue
-
-                out.append(
-                    {
-                        "source": src,
-                        "type": typ,
-                        "title": title,
-                        "link": url,
-                        "published_raw": published,
-                        "summary": summary,
-                    }
-                )
-
-                if len(out) >= MAX_API_ITEMS:
-                    break
-
-            page += 1
-
-        except Exception as e:
-            log(f"Ontario API fetch error page={page}: {e}")
-            break
-
-    return out
 
 def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -364,17 +343,98 @@ def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, An
         log(f"RSS fetch error for {source_name}: {e}")
     return out
 
+def _parse_links_bs4(html: str, base_url: str) -> List[Dict[str, str]]:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Dict[str, str]] = []
+
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        text = " ".join((a.get_text(" ") or "").split()).strip()
+        if href == "":
+            continue
+        if href.startswith("javascript:"):
+            continue
+        link = urljoin(base_url, href)
+        if text == "":
+            continue
+        out.append({"title": text, "link": link})
+
+    return out
+
+def _parse_links_regex(html: str, base_url: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for m in re.finditer(r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html or ""):
+        href = " ".join((m.group(1) or "").split()).strip()
+        inner = m.group(2) or ""
+        text = re.sub(r"(?is)<[^>]+>", " ", inner)
+        text = " ".join(text.split()).strip()
+        if href == "" or text == "":
+            continue
+        if href.startswith("javascript:"):
+            continue
+        link = urljoin(base_url, href)
+        out.append({"title": text, "link": link})
+    return out
+
+def fetch_screen_scrape(url: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        r = session.get(url, timeout=SCREEN_SCRAPE_TIMEOUT_SEC)
+        r.raise_for_status()
+        html = r.text or ""
+
+        parsed: List[Dict[str, str]] = []
+        try:
+            parsed = _parse_links_bs4(html, url)
+        except Exception:
+            parsed = _parse_links_regex(html, url)
+
+        seen: set = set()
+        base_host = host_of(url)
+
+        for it in parsed:
+            title = str(it.get("title") or "").strip()
+            link = str(it.get("link") or "").strip()
+
+            if title == "" or link == "":
+                continue
+
+            link_host = host_of(link)
+            if base_host and link_host and link_host != base_host:
+                continue
+
+            key = (title.lower(), link.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            out.append(
+                {
+                    "source": infer_source_from_url(url),
+                    "type": infer_type_from_url(url),
+                    "title": title,
+                    "link": link,
+                    "published_raw": "",
+                    "summary": "",
+                }
+            )
+
+            if len(out) >= SCREEN_SCRAPE_MAX_LINKS_PER_PAGE:
+                break
+
+    except Exception as e:
+        log(f"Screen scrape error url={url}: {e}")
+
+    return out
+
 def collect_items() -> List[Dict[str, Any]]:
     dbg("STEP fetch.start")
     items: List[Dict[str, Any]] = []
 
-    a = fetch_ontario_news_pages()
-    dbg(f"STEP fetch.ontario_api items={len(a)}")
-    items.extend(a)
-
     for u in FEED_URLS:
-        x = fetch_rss(u, "Ontario RSS", "Ontario RSS")
-        dbg(f"STEP fetch.rss url={u} items={len(x)}")
+        x = fetch_screen_scrape(u)
+        dbg(f"STEP fetch.screen url={u} items={len(x)}")
         items.extend(x)
 
     for f in REGISTRY_FEEDS:
@@ -623,7 +683,6 @@ def main() -> None:
     log("RUN start")
     log(f"DEBUG={1 if DEBUG else 0} DRY_RUN={1 if DRY_RUN else 0} POST_ENABLED={1 if POST_ENABLED else 0}")
     log(f"MAX_STORE_ITEMS={MAX_STORE_ITEMS} MAX_ENRICH_ITEMS={MAX_ENRICH_ITEMS} MAX_AGE_DAYS={MAX_AGE_DAYS}")
-    log(f"MAX_API_ITEMS={MAX_API_ITEMS} MAX_API_PAGES={MAX_API_PAGES} API_PAGE_SIZE={API_PAGE_SIZE}")
     log("STORE_REMOTE_ENABLED=" + ("1" if STORE_REMOTE_ENABLED else "0"))
 
     if RESET_STORE:
