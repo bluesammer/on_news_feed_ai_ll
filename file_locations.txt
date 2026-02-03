@@ -1,7 +1,11 @@
 C:\Users\Blues\1 lifelabs news ontario feed better now
 
+"C:\Users\Blues\1 lifelabs news ontario feed better now\
 
-"C:\Users\Blues\1 lifelabs news ontario feed better now\OH_feed_ingest_step1_V7.ipynb"
+
+Feb 3. 
+OH_feed_ingest_step1_V11ai.ipynb
+
 
 
 What this script does.
