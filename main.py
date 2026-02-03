@@ -365,7 +365,21 @@ def derive_title_from_path(path: str) -> str:
 def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
-        parsed = feedparser.parse(url)
+        r = session.get(url, timeout=30)
+        if DEBUG:
+            dbg(f"STEP rss.http src={source_name} code={r.status_code} bytes={len(r.content or b'')}")
+        r.raise_for_status()
+
+        parsed = feedparser.parse(r.content)
+
+        if DEBUG:
+            dbg(
+                "STEP rss.parsed "
+                f"src={source_name} entries={len(parsed.entries or [])} "
+                f"bozo={getattr(parsed,'bozo',0)} "
+                f"err={str(getattr(parsed,'bozo_exception',''))[:120]}"
+            )
+
         for e in (parsed.entries or []):
             title = str(getattr(e, "title", "") or "").strip()
             link = str(getattr(e, "link", "") or "").strip()
@@ -374,7 +388,6 @@ def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, An
 
             if SKIP_RSS_IF_NO_PUBLISHED and published == "":
                 continue
-
             if title == "" and link == "":
                 continue
 
@@ -388,9 +401,13 @@ def fetch_rss(url: str, source_name: str, source_type: str) -> List[Dict[str, An
                     "summary": summary,
                 }
             )
+
     except Exception as e:
         log(f"RSS fetch error for {source_name}: {e}")
+
     return out
+
+
 
 def _parse_links_bs4(html: str, base_url: str) -> List[Dict[str, str]]:
     from bs4 import BeautifulSoup  # type: ignore
