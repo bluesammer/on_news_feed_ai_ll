@@ -49,8 +49,8 @@ from openai import OpenAI
 
 # Screen scrape sources
 FEED_URLS = [
-    "https://news.ontario.ca/moh/en",
-    "https://news.ontario.ca/mltc/en",
+    "https://news.ontario.ca/moh/en",     # JS app, handled via embedded paths
+    "https://news.ontario.ca/mltc/en",    # JS app, handled via embedded paths
     "https://www.ontariohealth.ca/news",
     "https://www.publichealthontario.ca/en/Education-and-Events/Events",
 ]
@@ -119,6 +119,12 @@ SKIP_RSS_IF_NO_PUBLISHED = (os.getenv("SKIP_RSS_IF_NO_PUBLISHED", "1") or "1").s
 SCREEN_SCRAPE_MAX_LINKS_PER_PAGE = int((os.getenv("SCREEN_SCRAPE_MAX_LINKS_PER_PAGE", "30") or "30").strip())
 SCREEN_SCRAPE_TIMEOUT_SEC = int((os.getenv("SCREEN_SCRAPE_TIMEOUT_SEC", "30") or "30").strip())
 
+# Ontario Newsroom (JS) support
+NEWSROOM_MAX_PATHS = int((os.getenv("NEWSROOM_MAX_PATHS", "60") or "60").strip())
+NEWSROOM_FETCH_ARTICLE_META = (os.getenv("NEWSROOM_FETCH_ARTICLE_META", "1") or "1").strip() == "1"
+NEWSROOM_META_FETCH_LIMIT = int((os.getenv("NEWSROOM_META_FETCH_LIMIT", "25") or "25").strip())
+NEWSROOM_META_TIMEOUT_SEC = int((os.getenv("NEWSROOM_META_TIMEOUT_SEC", "20") or "20").strip())
+
 TOPICS = [
     "Billing and Funding Changes",
     "Lab Services and Community Labs",
@@ -147,6 +153,15 @@ ENRICH_SYSTEM = (
 )
 
 MONEY_RE = re.compile(r"(?i)\$[\s]*([\d]{1,3}(?:,[\d]{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
+
+# Newsroom patterns for embedded paths and article metadata
+NEWSROOM_PATH_RE = re.compile(
+    r'(?i)(/en/(?:release|bulletin|backgrounder|statement|media-advisory)/[^"\'\s\\]+)'
+)
+OG_TITLE_RE = re.compile(r'(?is)<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']')
+HTML_TITLE_RE = re.compile(r"(?is)<title>\s*(.*?)\s*</title>")
+PUBLISHED_META_RE = re.compile(r'(?is)<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']')
+JSONLD_DATE_RE = re.compile(r'(?is)"datePublished"\s*:\s*"([^"]+)"')
 
 
 # =========================
@@ -204,6 +219,20 @@ def safe_parse_dt(s: str) -> Optional[datetime]:
         return None
     try:
         dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def parse_iso_dt(s: str) -> Optional[datetime]:
+    t = (s or "").strip()
+    if t == "":
+        return None
+    try:
+        if t.endswith("Z"):
+            t = t.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -308,6 +337,23 @@ def infer_type_from_url(url: str) -> str:
         return "PHO Events"
     return "Screen Scrape"
 
+def cleanup_title(t: str) -> str:
+    x = re.sub(r"(?is)<[^>]+>", " ", t or "")
+    x = " ".join(x.split()).strip()
+    return x
+
+def derive_title_from_path(path: str) -> str:
+    p = (path or "").strip("/")
+    segs = [s for s in p.split("/") if s]
+    if len(segs) == 0:
+        return ""
+    last = segs[-1]
+    last = re.sub(r"[^a-zA-Z0-9\-]+", "", last)
+    if last == "":
+        return ""
+    words = [w for w in last.replace("-", " ").split() if w]
+    return " ".join([w[:1].upper() + w[1:] for w in words])
+
 
 # =========================
 # FETCH
@@ -377,6 +423,57 @@ def _parse_links_regex(html: str, base_url: str) -> List[Dict[str, str]]:
         out.append({"title": text, "link": link})
     return out
 
+def newsroom_extract_article_urls(html: str, base_url: str) -> List[str]:
+    base = "https://news.ontario.ca"
+    paths = NEWSROOM_PATH_RE.findall(html or "")
+    uniq: List[str] = []
+    seen = set()
+    for p in paths:
+        p2 = (p or "").strip()
+        if p2 == "":
+            continue
+        if p2.endswith((".png", ".jpg", ".jpeg", ".svg", ".css", ".js")):
+            continue
+        u = urljoin(base, p2)
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+        if len(uniq) >= NEWSROOM_MAX_PATHS:
+            break
+    return uniq
+
+def fetch_newsroom_article_meta(article_url: str) -> Dict[str, str]:
+    out = {"title": "", "published_iso": ""}
+    try:
+        r = session.get(article_url, timeout=NEWSROOM_META_TIMEOUT_SEC)
+        r.raise_for_status()
+        html = r.text or ""
+
+        m = OG_TITLE_RE.search(html)
+        if m:
+            out["title"] = cleanup_title(m.group(1))
+        if out["title"] == "":
+            m2 = HTML_TITLE_RE.search(html)
+            if m2:
+                out["title"] = cleanup_title(m2.group(1))
+
+        mp = PUBLISHED_META_RE.search(html)
+        if mp:
+            dt = safe_parse_dt(mp.group(1).strip())
+            if dt:
+                out["published_iso"] = dt.isoformat().replace("+00:00", "Z")
+        if out["published_iso"] == "":
+            mj = JSONLD_DATE_RE.search(html)
+            if mj:
+                dt = safe_parse_dt(mj.group(1).strip())
+                if dt:
+                    out["published_iso"] = dt.isoformat().replace("+00:00", "Z")
+
+    except Exception:
+        return out
+    return out
+
 def fetch_screen_scrape(url: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
@@ -384,6 +481,47 @@ def fetch_screen_scrape(url: str) -> List[Dict[str, Any]]:
         r.raise_for_status()
         html = r.text or ""
 
+        base_host = host_of(url)
+
+        # Ontario Newsroom is a JS app, but HTML often includes embedded article paths.
+        if "news.ontario.ca" in base_host:
+            article_urls = newsroom_extract_article_urls(html, url)
+            dbg(f"STEP newsroom.paths url={url} paths={len(article_urls)}")
+
+            meta_fetched = 0
+            for aurl in article_urls:
+                path = urlparse(aurl).path
+                title = derive_title_from_path(path)
+                published_raw = ""
+
+                if NEWSROOM_FETCH_ARTICLE_META and meta_fetched < NEWSROOM_META_FETCH_LIMIT:
+                    meta = fetch_newsroom_article_meta(aurl)
+                    if meta.get("title"):
+                        title = meta["title"]
+                    if meta.get("published_iso"):
+                        published_raw = meta["published_iso"]
+                    meta_fetched += 1
+
+                if title == "":
+                    title = aurl
+
+                out.append(
+                    {
+                        "source": infer_source_from_url(url),
+                        "type": infer_type_from_url(url),
+                        "title": title,
+                        "link": aurl,
+                        "published_raw": published_raw,
+                        "summary": "",
+                    }
+                )
+
+                if len(out) >= SCREEN_SCRAPE_MAX_LINKS_PER_PAGE:
+                    break
+
+            return out
+
+        # Normal HTML pages
         parsed: List[Dict[str, str]] = []
         try:
             parsed = _parse_links_bs4(html, url)
@@ -391,7 +529,6 @@ def fetch_screen_scrape(url: str) -> List[Dict[str, Any]]:
             parsed = _parse_links_regex(html, url)
 
         seen: set = set()
-        base_host = host_of(url)
 
         for it in parsed:
             title = str(it.get("title") or "").strip()
@@ -667,10 +804,10 @@ def index_by_id(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return idx
 
 def sort_newest(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def k(x: Dict[str, Any]) -> str:
-        p = str(x.get("published") or "")
-        i = str(x.get("ingested_at") or "")
-        return p + "|" + i
+    def k(x: Dict[str, Any]) -> datetime:
+        p = parse_iso_dt(str(x.get("published") or ""))
+        i = parse_iso_dt(str(x.get("ingested_at") or ""))
+        return p or i or datetime(1970, 1, 1, tzinfo=timezone.utc)
     items.sort(key=k, reverse=True)
     return items
 
@@ -684,6 +821,7 @@ def main() -> None:
     log(f"DEBUG={1 if DEBUG else 0} DRY_RUN={1 if DRY_RUN else 0} POST_ENABLED={1 if POST_ENABLED else 0}")
     log(f"MAX_STORE_ITEMS={MAX_STORE_ITEMS} MAX_ENRICH_ITEMS={MAX_ENRICH_ITEMS} MAX_AGE_DAYS={MAX_AGE_DAYS}")
     log("STORE_REMOTE_ENABLED=" + ("1" if STORE_REMOTE_ENABLED else "0"))
+    log(f"NEWSROOM_FETCH_ARTICLE_META={1 if NEWSROOM_FETCH_ARTICLE_META else 0} NEWSROOM_META_FETCH_LIMIT={NEWSROOM_META_FETCH_LIMIT}")
 
     if RESET_STORE:
         store = {"meta": {"reset_at": utc_iso_z()}, "items": []}
@@ -710,6 +848,9 @@ def main() -> None:
         published_raw = str(ri.get("published_raw") or "").strip()
 
         published_dt = safe_parse_dt(published_raw)
+        if published_dt is None:
+            published_dt = parse_iso_dt(published_raw)
+
         if is_too_old(published_dt):
             dropped_old += 1
             continue
@@ -733,9 +874,9 @@ def main() -> None:
 
         prev = existing_idx.get(_id)
         if prev:
-            for k in ENRICH_FIELDS:
-                if k in prev:
-                    base_item[k] = prev.get(k)
+            for k2 in ENRICH_FIELDS:
+                if k2 in prev:
+                    base_item[k2] = prev.get(k2)
             existing_idx[_id] = {**prev, **base_item}
             merged += 1
         else:
