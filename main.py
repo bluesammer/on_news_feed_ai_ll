@@ -33,6 +33,7 @@ import sys
 import json
 import re
 import hashlib
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 from email.utils import parsedate_to_datetime
@@ -43,6 +44,7 @@ import feedparser
 from requests.adapters import HTTPAdapter, Retry
 
 from openai import OpenAI
+from openai import RateLimitError, APIError, APITimeoutError, APIConnectionError
 
 
 # =========================
@@ -89,6 +91,13 @@ MAX_AGE_DAYS = int((os.getenv("MAX_AGE_DAYS", "365") or "365").strip())
 
 ENRICH_ENABLED = (os.getenv("ENRICH_ENABLED", "1") or "1").strip() == "1"
 ENRICH_MODEL = (os.getenv("ENRICH_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+
+# Behavior on OpenAI limits/errors
+STOP_ENRICH_ON_RATE_LIMIT = (os.getenv("STOP_ENRICH_ON_RATE_LIMIT", "1") or "1").strip() == "1"
+STOP_ENRICH_ON_OPENAI_ERROR = (os.getenv("STOP_ENRICH_ON_OPENAI_ERROR", "0") or "0").strip() == "1"
+OPENAI_RETRY_ON_TRANSIENT_ERRORS = int((os.getenv("OPENAI_RETRY_ON_TRANSIENT_ERRORS", "1") or "1").strip())
+OPENAI_RETRY_BACKOFF_SEC = float((os.getenv("OPENAI_RETRY_BACKOFF_SEC", "2.5") or "2.5").strip())
+OPENAI_RETRY_BACKOFF_MAX_SEC = float((os.getenv("OPENAI_RETRY_BACKOFF_MAX_SEC", "15") or "15").strip())
 
 # Edge Function post (Lovable reads this)
 FEED_POST_URL = (
@@ -175,7 +184,7 @@ TOPICS = [
 ALLOWED_TOPICS = set(TOPICS)
 
 ENRICH_SYSTEM = (
-    "Return ONLY valid JSON. No markdown. No code fences. No extra text.\n"
+    "Return ONLY valid JSON.\n"
     "Keys: summary, topic, score, keywords, city.\n"
     "summary: 1 to 2 short sentences.\n"
     "topic must match an allowed topic.\n"
@@ -831,9 +840,6 @@ def apply_feedback_adjustment(
     source: str,
     fb_model: Dict[str, Any],
 ) -> Tuple[int, int, List[str]]:
-    """
-    Returns: (final_score, delta, reasons)
-    """
     if FEEDBACK_ENABLED is False:
         return clamp_0_100(base_score), 0, []
 
@@ -906,13 +912,11 @@ def build_feedback_prompt_hint(
         if d != 0:
             hints.append((abs(d), f"source_bias {s} {d:+d}"))
 
-    # Top topics by absolute weight
     for k, v in list(topic_adj.items())[:2000]:
         vv = safe_int(v, 0)
         if vv != 0:
             hints.append((abs(vv), f"topic_bias {k} {vv:+d}"))
 
-    # Top keywords by absolute weight
     for k, v in list(keyword_adj.items())[:3000]:
         vv = safe_int(v, 0)
         if vv != 0:
@@ -940,6 +944,30 @@ def get_openai_client() -> Optional[OpenAI]:
         raise RuntimeError("Missing OPENAI_API_KEY.")
     return OpenAI(api_key=key)
 
+def _openai_call_with_retry(client: OpenAI, messages: List[Dict[str, str]]) -> str:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = client.chat.completions.create(
+                model=ENRICH_MODEL,
+                messages=messages,
+                temperature=0.0,
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        except RateLimitError:
+            raise
+
+        except (APITimeoutError, APIConnectionError, APIError) as e:
+            if OPENAI_RETRY_ON_TRANSIENT_ERRORS <= 0:
+                raise
+            if attempt > OPENAI_RETRY_ON_TRANSIENT_ERRORS:
+                raise
+            wait = min(OPENAI_RETRY_BACKOFF_MAX_SEC, OPENAI_RETRY_BACKOFF_SEC * (2 ** (attempt - 1)))
+            dbg(f"STEP enrich.retry attempt={attempt} wait_sec={wait:.1f} err={str(e)[:120]}")
+            time.sleep(wait)
+
 def enrich_one(client: OpenAI, item: Dict[str, Any], fb_model: Dict[str, Any]) -> Dict[str, Any]:
     title = str(item.get("title") or "")
     summary = str(item.get("summary") or "")
@@ -948,7 +976,6 @@ def enrich_one(client: OpenAI, item: Dict[str, Any], fb_model: Dict[str, Any]) -
 
     money_vals = extract_money_values(text)
     loc_hint = heuristic_city_hint(text)
-
     feedback_hint = build_feedback_prompt_hint(str(item.get("source") or ""), fb_model)
 
     user_prompt = (
@@ -972,16 +999,13 @@ def enrich_one(client: OpenAI, item: Dict[str, Any], fb_model: Dict[str, Any]) -
         + text[:6000]
     )
 
-    resp = client.chat.completions.create(
-        model=ENRICH_MODEL,
+    raw = _openai_call_with_retry(
+        client,
         messages=[
             {"role": "system", "content": ENRICH_SYSTEM},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.0,
     )
-
-    raw = (resp.choices[0].message.content or "").strip()
 
     if DEBUG:
         dbg("STEP enrich.model_raw_start")
@@ -1025,7 +1049,6 @@ def enrich_one(client: OpenAI, item: Dict[str, Any], fb_model: Dict[str, Any]) -
     if len(ai_city) > 80:
         ai_city = ai_city[:80].strip()
 
-    # Feedback adjustment happens after model score
     final_score, delta, reasons = apply_feedback_adjustment(
         base_score=ai_score_base,
         topic=ai_topic,
@@ -1042,7 +1065,6 @@ def enrich_one(client: OpenAI, item: Dict[str, Any], fb_model: Dict[str, Any]) -
     item["ai_error"] = ""
     item["money_values"] = money_vals
     item["enriched_at"] = utc_iso_z()
-
     item["ai_score_base"] = ai_score_base
     item["ai_score_adj"] = delta
     item["ai_score_adj_reasons"] = reasons
@@ -1132,7 +1154,6 @@ def main() -> None:
     log(f"NEWSROOM_FETCH_ARTICLE_META={1 if NEWSROOM_FETCH_ARTICLE_META else 0} NEWSROOM_META_FETCH_LIMIT={NEWSROOM_META_FETCH_LIMIT}")
     log(f"FEEDBACK_ENABLED={1 if FEEDBACK_ENABLED else 0} FEEDBACK_MAX_ENTRIES={FEEDBACK_MAX_ENTRIES}")
 
-    # Load feedback once per run
     feedback = load_scoring_feedback()
     fb_model = build_feedback_model(feedback)
     dbg(
@@ -1233,26 +1254,44 @@ def main() -> None:
 
     ok_ct = 0
     err_ct = 0
+    attempted_ct = 0
+    enrich_stop_reason = ""
 
     if client is None:
         dbg("STEP enrich.skip reason=ENRICH_ENABLED=0")
     else:
         for i, it in enumerate(batch, start=1):
             dbg(f"STEP enrich.item {i}/{len(batch)} src={it.get('source')} title={str(it.get('title') or '')[:70]}")
-            updated = enrich_one(client, it, fb_model)
-            if str(updated.get("ai_error") or "").strip() == "":
-                ok_ct += 1
-            else:
+            attempted_ct += 1
+            try:
+                updated = enrich_one(client, it, fb_model)
+                if str(updated.get("ai_error") or "").strip() == "":
+                    ok_ct += 1
+                else:
+                    err_ct += 1
+
+                dbg(
+                    "STEP enrich.result "
+                    f"{i}/{len(batch)} "
+                    f"ok={1 if str(updated.get('ai_error') or '').strip()=='' else 0} "
+                    f"score_base={updated.get('ai_score_base',0)} "
+                    f"score_adj={updated.get('ai_score_adj',0)} "
+                    f"score_final={updated.get('ai_score',0)}"
+                )
+                existing_idx[updated["id"]] = updated
+
+            except RateLimitError as e:
+                enrich_stop_reason = "rate_limit_429"
+                log(f"STEP enrich.stop reason=rate_limit_429 msg={(str(e) or '')[:240]}")
+                if STOP_ENRICH_ON_RATE_LIMIT:
+                    break
+
+            except Exception as e:
+                enrich_stop_reason = "openai_error"
+                log(f"STEP enrich.error kind=openai_error err={(str(e) or '')[:240]}")
                 err_ct += 1
-            dbg(
-                "STEP enrich.result "
-                f"{i}/{len(batch)} "
-                f"ok={1 if str(updated.get('ai_error') or '').strip()=='' else 0} "
-                f"score_base={updated.get('ai_score_base',0)} "
-                f"score_adj={updated.get('ai_score_adj',0)} "
-                f"score_final={updated.get('ai_score',0)}"
-            )
-            existing_idx[updated["id"]] = updated
+                if STOP_ENRICH_ON_OPENAI_ERROR:
+                    break
 
     all_items = list(existing_idx.values())
     sort_newest(all_items)
@@ -1266,9 +1305,10 @@ def main() -> None:
         "dropped_old": dropped_old,
         "store_items": len(all_items),
         "unenriched_remaining": len([x for x in all_items if str(x.get("ai_summary") or "").strip() == ""]),
-        "enriched_this_run": len(batch) if ENRICH_ENABLED else 0,
+        "enriched_this_run": attempted_ct if ENRICH_ENABLED else 0,
         "enrich_ok": ok_ct,
         "enrich_err": err_ct,
+        "enrich_stop_reason": enrich_stop_reason,
         "feedback_updated_at": str(fb_model.get("updated_at") or ""),
         "feedback_entries_used": int(fb_model.get("entries_used") or 0),
         "feedback_topic_rules": len(fb_model.get("topic_adj") or {}),
@@ -1289,7 +1329,7 @@ def main() -> None:
     dbg(f"STEP post.plan items={len(all_items)}")
     post_full_store(all_items)
 
-    log(f"RUN done store_items={len(all_items)} enrich_ok={ok_ct} enrich_err={err_ct}")
+    log(f"RUN done store_items={len(all_items)} enrich_ok={ok_ct} enrich_err={err_ct} enrich_stop_reason={enrich_stop_reason}")
 
 if __name__ == "__main__":
     main()
